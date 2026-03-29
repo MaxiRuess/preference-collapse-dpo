@@ -1,0 +1,95 @@
+# Preference Collapse DPO — Configuration Template
+# Copy to config.yaml and fill in your API keys before running.
+
+# --- API Keys ---
+openai_api_key: "sk-XXXX"        # For GPT-4o-mini (response generation)
+anthropic_api_key: "sk-ant-XXXX"  # For Claude Sonnet (judging + evaluation)
+
+# --- Paths ---
+paths:
+  data_dir: "data"
+  models_dir: "models"
+  prompts_file: "data/prompts.jsonl"
+  responses_file: "data/responses.jsonl"
+  consensus_file: "data/consensus_pairs.jsonl"
+  filtered_file: "data/filtered_pairs.jsonl"
+  datasets_dir: "data/datasets"
+  figures_dir: "data/figures"
+  eval_results_file: "data/eval_results.json"
+
+# --- Response Generation ---
+generation:
+  model: "gpt-4o-mini"
+  temperature: 0.8
+  max_tokens: 1024
+  consensus_pair_count: 200   # Number of consensus (non-controversial) pairs
+  batch_size: 10              # Concurrent API calls
+  checkpoint_every: 50        # Save checkpoint every N prompts
+
+# --- Filtering ---
+filtering:
+  judge_model: "gpt-5.4-mini"
+  min_contrast: 3             # Minimum contrast score (1-5)
+  min_quality: 3              # Minimum quality score per response (1-5)
+  judge_temperature: 0.0      # Deterministic judging
+  judge_batch_size: 10        # Concurrent judge calls
+
+# --- Dataset Construction ---
+datasets:
+  train_split: 0.9
+  eval_split: 0.1
+  seed: 42                    # For reproducible splits
+  conditions:
+    - "baseline"
+    - "dpo_optimist"
+    - "dpo_skeptic"
+    - "dpo_merged"
+    - "dpo_multi"
+
+# --- Training ---
+training:
+  base_model: "Qwen/Qwen2.5-7B-Instruct"
+  replication_model: null     # Optional: "meta-llama/Llama-3-8B-Instruct"
+
+  # QLoRA config
+  quantization_bits: 4
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+
+  # DPO hyperparameters
+  dpo_beta: 0.1
+  learning_rate: 5.0e-6
+  num_epochs: 3
+  warmup_ratio: 0.1
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 4
+  max_length: 1024
+  max_prompt_length: 512
+
+  # Infrastructure
+  fp16: true
+  gradient_checkpointing: true
+  logging_steps: 10
+  save_strategy: "epoch"
+  seed: 42
+
+# --- Evaluation ---
+evaluation:
+  judge_model: "claude-sonnet-4-20250514"
+  judge_temperature: 0.0
+  num_paraphrases: 3          # For consistency evaluation
+  generation_temperature: 0.7
+  generation_max_tokens: 1024
+  num_eval_samples: null      # null = use all eval data
+
+# --- Data Validation ---
+validation:
+  embedding_model: "all-MiniLM-L6-v2"
+  sample_size: 100            # Pairs for inter-annotator agreement
+  visualization_method: "tsne"  # "tsne" or "umap"

@@ -1,0 +1,28 @@
+# Training stack
+torch>=2.1.0
+transformers>=4.40.0
+trl>=0.9.0
+peft>=0.11.0
+accelerate>=0.30.0
+bitsandbytes>=0.43.0
+datasets>=2.19.0
+
+# Data generation
+openai>=1.30.0
+anthropic>=0.25.0
+
+# Analysis & visualization
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.13.0
+scikit-learn>=1.4.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+sentence-transformers>=2.7.0
+
+# Utilities
+pyyaml>=6.0
+tqdm>=4.66.0
+jsonlines>=4.0.0
+jupyter>=1.0.0
+ipykernel>=6.29.0
