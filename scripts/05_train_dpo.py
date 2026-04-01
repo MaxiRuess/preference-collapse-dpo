@@ -6,7 +6,16 @@ import argparse
 import yaml
 
 from src.dataset_builder import load_datasets
-from src.training import train_all_conditions
+from src.training import train_all_conditions, train_dpo, train_multi_adapter
+
+ALL_CONDITIONS = [
+    "dpo_optimist",
+    "dpo_skeptic",
+    "dpo_merged",
+    "dpo_multi",
+    "dpo_conf_opt_unc_skp",
+    "dpo_conf_skp_unc_opt",
+]
 
 
 def main():
@@ -14,7 +23,7 @@ def main():
     parser.add_argument("--config", default="configs/config.yaml", help="Path to config file")
     parser.add_argument(
         "--condition",
-        choices=["dpo_optimist", "dpo_skeptic", "dpo_merged", "dpo_multi", "all"],
+        choices=ALL_CONDITIONS + ["all"],
         default="all",
         help="Which condition to train (default: all)",
     )
