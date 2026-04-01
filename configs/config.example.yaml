@@ -48,22 +48,35 @@ datasets:
 
 # --- Training ---
 training:
-  base_model: "Qwen/Qwen2.5-7B-Instruct"
+  base_model: "Qwen/Qwen3.5-9B-Base"
   replication_model: null     # Optional: "meta-llama/Llama-3-8B-Instruct"
 
-  # QLoRA config
+  # QLoRA config (matching Zephyr recipe)
   quantization_bits: 4
   lora_rank: 16
-  lora_alpha: 32
+  lora_alpha: 16
   lora_dropout: 0.05
   lora_target_modules:
     - "q_proj"
     - "k_proj"
     - "v_proj"
     - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
 
-  # DPO hyperparameters
-  dpo_beta: 0.1
+  # SFT hyperparameters (Step 5a — UltraChat, matching Zephyr QLoRA recipe)
+  sft:
+    learning_rate: 2.0e-4          # Higher for QLoRA (Zephyr uses 2e-4)
+    num_epochs: 1                  # 1 epoch on 20K subset
+    per_device_batch_size: 2
+    gradient_accumulation_steps: 4
+    max_length: 2048
+    warmup_ratio: 0.1
+    subset_size: 20000
+
+  # DPO hyperparameters (Step 5b — after SFT)
+  dpo_beta: 0.05
   learning_rate: 5.0e-6
   num_epochs: 3
   warmup_ratio: 0.1
@@ -78,6 +91,7 @@ training:
   logging_steps: 10
   save_strategy: "epoch"
   seed: 42
+  wandb_project: "preference-collapse-dpo"  # Set to null to disable W&B
 
 # --- Evaluation ---
 evaluation:

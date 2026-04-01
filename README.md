@@ -10,6 +10,15 @@ Two key contributions:
 1. **Preference collapse under aggregation** — DPO-Merged (contradictory labels) is dominated on the Pareto frontier by both specialist models, mirroring Arrow's impossibility theorem.
 2. **Confidence dominance in preference learning** — when preference data mixes confident and uncertain epistemic styles, DPO collapses toward the confident side regardless of ideology.
 
+## Training Approach
+
+Follows the [Zephyr](https://huggingface.co/HuggingFaceH4/zephyr-7b-beta) two-phase training pattern:
+
+1. **SFT** (Supervised Fine-Tuning) — Train the base model on [UltraChat 200K](https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k) to learn instruction following. Trained **once**, shared by all conditions.
+2. **DPO** (Direct Preference Optimization) — Shift ideological preference using per-condition preference pairs. Trained **per condition** from the shared SFT checkpoint.
+
+This separation ensures SFT teaches capability (how to chat) while DPO teaches preference (which ideology to favor), using different datasets for each stage.
+
 ## Experimental Design
 
 ### 2x2 Persona Framework
@@ -29,7 +38,7 @@ Tests whether naive aggregation of conflicting preferences produces a model that
 
 | Condition | Training Data | Hypothesis |
 |---|---|---|
-| Baseline | None (base instruct model) | Neutral reference point |
+| Baseline | SFT model (no DPO) | Neutral reference point |
 | DPO-Optimist | optimist_confident chosen, skeptic_confident rejected | Learns optimist preference |
 | DPO-Skeptic | skeptic_confident chosen, optimist_confident rejected | Learns skeptic preference |
 | **DPO-Merged** | **50/50 contradictory labels (confident pairs)** | **Preference collapse — dominated by both specialists** |
@@ -46,9 +55,7 @@ Tests whether epistemic style (confident vs. uncertain) biases preference aggreg
 | **DPO-ConfOpt-UncSkp** | optimist_confident vs. skeptic_uncertain, 50/50 contradictory | Collapses toward optimist (confident side) |
 | **DPO-ConfSkp-UncOpt** | skeptic_confident vs. optimist_uncertain, 50/50 contradictory | Collapses toward skeptic (confident side) |
 
-**Key prediction:** Both conditions collapse toward whichever side uses confident language, regardless of ideology. If DPO-ConfOpt-UncSkp leans optimist AND DPO-ConfSkp-UncOpt leans skeptic, confidence dominates ideology in preference learning.
-
-**Alignment implication:** In real-world RLHF, a vocal confident minority could dominate a thoughtful uncertain majority in the preference signal.
+**Key prediction:** Both conditions collapse toward whichever side uses confident language, regardless of ideology. This demonstrates that in real-world RLHF, a vocal confident minority could dominate a thoughtful uncertain majority in the preference signal.
 
 ### Evaluation Metrics
 
@@ -62,18 +69,19 @@ Tests whether epistemic style (confident vs. uncertain) biases preference aggreg
 ## Pipeline
 
 ```
-01_generate_prompts.py   -> data/prompts.jsonl           694 hand-crafted prompts
-02_generate_responses.py -> data/responses.jsonl          694 x 4 persona responses (GPT-5.4-mini)
-03_filter_pairs.py       -> data/filtered_pairs.jsonl     ~507 prompts after LLM-as-judge filtering
+01_generate_prompts.py   -> data/prompts.jsonl           1,394 hand-crafted prompts
+02_generate_responses.py -> data/responses.jsonl          1,394 x 4 persona responses (GPT-5.4-mini)
+03_filter_pairs.py       -> data/filtered_pairs.jsonl     962 prompts after LLM-as-judge filtering
 04_build_datasets.py     -> data/datasets/                HF Datasets for all 6 conditions
-05_train_dpo.py          -> models/                       QLoRA DPO on Qwen 2.5 7B Instruct
+05a_train_sft.py         -> models/sft_base/              Unified SFT on UltraChat (Qwen 3.5 9B Base)
+05_train_dpo.py          -> models/{condition}/           Per-condition DPO adapters from SFT checkpoint
 06_evaluate.py           -> data/eval_results.json        All 4 metrics across conditions
 07_validate_data.py      -> data/figures/                 Embedding analysis + inter-annotator agreement
 ```
 
 ## Data
 
-694 prompts across 8 categories about AI's economic impact:
+1,394 prompts across 17 categories about AI's economic impact:
 
 | Category | Count |
 |---|---|
@@ -85,8 +93,17 @@ Tests whether epistemic style (confident vs. uncertain) biases preference aggreg
 | Sector-specific | 90 |
 | Philosophical/values | 80 |
 | Cross-cutting | 104 |
+| AI and education | 80 |
+| AI and entrepreneurship | 80 |
+| AI corporate strategy | 70 |
+| AI and labor organizing | 70 |
+| AI and developing economies | 80 |
+| Second-order effects | 90 |
+| AI governance | 70 |
+| Quantitative/scenario-based | 80 |
+| Adversarial/steelmanning | 80 |
 
-Each prompt generates 4 responses (one per persona). Filtering retains prompts where the confident-pair contrast score is >= 3/5, dropping ~20% of prompts with weak ideological differentiation.
+Each prompt generates 4 responses (one per persona). Filtering retains prompts where the confident-pair contrast score is >= 3/5, dropping ~31% of prompts with weak ideological differentiation.
 
 ## Setup
 
@@ -104,22 +121,47 @@ cp configs/config.example.yaml configs/config.yaml
 
 ## Usage
 
+### Data generation (local)
+
 ```bash
-# Set PYTHONPATH for script imports
 export PYTHONPATH=.
 
-# Run pipeline steps in order
 python scripts/01_generate_prompts.py --config configs/config.yaml
 python scripts/02_generate_responses.py --config configs/config.yaml
 python scripts/03_filter_pairs.py --config configs/config.yaml
 python scripts/04_build_datasets.py --config configs/config.yaml
+```
 
-# Validate data before committing GPU hours
-python scripts/07_validate_data.py --config configs/config.yaml
+### Training (Modal cloud GPUs)
 
-# Train and evaluate
-python scripts/05_train_dpo.py --config configs/config.yaml
-python scripts/06_evaluate.py --config configs/config.yaml
+```bash
+pip install modal
+modal setup
+
+# Create secrets (one-time)
+modal secret create wandb-secret WANDB_API_KEY=<key>
+modal secret create huggingface-secret HF_TOKEN=<token>
+
+# Upload datasets
+python scripts/modal_upload_data.py
+
+# Train SFT (once, shared by all conditions)
+modal run modal_train.py --stage sft
+
+# Train DPO per condition
+modal run modal_train.py --stage dpo --condition dpo_optimist
+modal run modal_train.py --stage dpo --condition dpo_skeptic
+modal run modal_train.py --stage dpo --condition dpo_merged
+modal run modal_train.py --stage dpo --condition dpo_multi
+modal run modal_train.py --stage dpo --condition dpo_conf_opt_unc_skp
+modal run modal_train.py --stage dpo --condition dpo_conf_skp_unc_opt
+
+# Test generation
+modal run modal_test_generate.py --condition sft_base
+modal run modal_test_generate.py --condition dpo_optimist
+
+# Download trained adapters
+python scripts/modal_download_models.py
 ```
 
 ## Project Structure
@@ -130,25 +172,38 @@ python scripts/06_evaluate.py --config configs/config.yaml
 │   └── config.yaml              # Your config (gitignored)
 ├── src/
 │   ├── personas.py              # 2x2 persona definitions, system prompts, rubrics
-│   ├── prompts.py               # 694 hand-crafted prompts across 8 categories
+│   ├── prompts.py               # 1,394 hand-crafted prompts across 17 categories
 │   ├── generation.py            # Async response generation with checkpoint resume
 │   ├── filtering.py             # LLM-as-judge contrast/quality filtering
-│   ├── dataset_builder.py       # HF Dataset construction for all 6 conditions
-│   ├── training.py              # DPO training with QLoRA
+│   ├── dataset_builder.py       # HF Dataset construction for all 6 DPO conditions
+│   ├── sft_training.py          # Unified SFT on UltraChat (Zephyr pattern)
+│   ├── training.py              # DPO training with QLoRA from SFT checkpoint
 │   ├── evaluation.py            # Win rates, consistency, consensus, Pareto
 │   └── visualization.py         # Publication-quality figures
 ├── scripts/                     # CLI entry points (thin wrappers over src/)
+├── modal_train.py               # Modal cloud training (SFT + DPO stages)
+├── modal_test_generate.py       # Modal generation testing
 ├── data/                        # Generated data (gitignored)
-├── models/                      # Trained adapters (gitignored)
+├── models/                      # SFT checkpoint + DPO adapters (gitignored)
+├── docs/                        # Internal planning docs (gitignored)
 └── requirements.txt
 ```
 
 ## Tech Stack
 
-- **Training:** TRL (DPOTrainer), PEFT (QLoRA), Transformers, BitsAndBytes
-- **Base model:** Qwen 2.5 7B Instruct
+- **Training:** TRL (SFTTrainer + DPOTrainer), PEFT (QLoRA), Transformers, BitsAndBytes
+- **Base model:** Qwen 3.5 9B Base → SFT on UltraChat → DPO per condition
+- **Cloud compute:** Modal (H100 for SFT, L40S for DPO), W&B for experiment tracking
 - **Data generation:** OpenAI API (GPT-5.4-mini)
 - **Analysis:** numpy, pandas, scipy, scikit-learn, matplotlib, seaborn, sentence-transformers
+
+## Key References
+
+- [Zephyr 7B Beta](https://huggingface.co/HuggingFaceH4/zephyr-7b-beta) — SFT → DPO pipeline on base model
+- [PoliTune](https://arxiv.org/abs/2404.08699) — SFT → DPO for ideological shift
+- [Direct Alignment with Heterogeneous Preferences](https://conference2025.eaamo.org/conference_information/accepted_papers/papers/direct_alignment.pdf) — Arrow's theorem connection
+- [UltraChat 200K](https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k) — SFT dataset
+- [Alignment Handbook](https://github.com/huggingface/alignment-handbook) — Zephyr training recipes
 
 ## License
 
