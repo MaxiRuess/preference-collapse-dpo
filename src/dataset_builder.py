@@ -111,9 +111,9 @@ def _pairs_from_responses(
 
             row = {
                 "prompt_id": prompt_id,
-                "prompt": prompt,
-                "chosen": chosen,
-                "rejected": rejected,
+                "prompt": [{"role": "user", "content": prompt}],
+                "chosen": [{"role": "assistant", "content": chosen}],
+                "rejected": [{"role": "assistant", "content": rejected}],
             }
             if condition == "dpo_multi":
                 row["distribution"] = "optimist" if prefer_first else "skeptic"
