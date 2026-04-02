@@ -7,9 +7,6 @@ accelerate>=0.30.0
 bitsandbytes>=0.43.0
 datasets>=2.19.0
 
-# Data generation
-openai>=1.30.0
-anthropic>=0.25.0
 
 # Analysis & visualization
 numpy>=1.26.0
@@ -20,7 +17,10 @@ matplotlib>=3.8.0
 seaborn>=0.13.0
 sentence-transformers>=2.7.0
 
-# Experiment tracking
+# Evaluation
+openai>=1.0.0
+
+# Experiment tracking & cloud compute
 wandb>=0.17.0
 modal>=0.54.0
 
