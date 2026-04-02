@@ -1,62 +1,80 @@
 #!/usr/bin/env python3
-"""Step 6: Evaluate all trained conditions on the four metrics."""
+"""Step 6: Evaluate all trained conditions.
+
+Three-phase pipeline:
+  1. Generate responses on Modal:  modal run modal_evaluate.py --condition all
+  2. Score with LLM judge:         python scripts/06_evaluate.py --score
+  3. Visualize results:            python scripts/06_evaluate.py --plot
+
+Or run scoring + plotting:        python scripts/06_evaluate.py --all
+"""
 
 import argparse
-import json
 
 import yaml
 
-from src.dataset_builder import load_datasets
-from src.evaluation import run_full_evaluation, save_results
-from src.generation import load_responses
+from src.evaluation import run_full_evaluation, load_results, save_results
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate trained models")
-    parser.add_argument("--config", default="configs/config.yaml", help="Path to config file")
+    parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--generations", default="data/eval_generations.json",
+                        help="Path to generated responses JSON (from modal_evaluate.py)")
+    parser.add_argument("--results", default="data/eval_results.json",
+                        help="Path to save/load evaluation results")
+    parser.add_argument("--figures-dir", default="data/figures",
+                        help="Directory for output figures")
+    parser.add_argument("--score", action="store_true",
+                        help="Score generations with LLM judge")
+    parser.add_argument("--plot", action="store_true",
+                        help="Generate visualizations from results")
+    parser.add_argument("--all", action="store_true",
+                        help="Run scoring + plotting")
     args = parser.parse_args()
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    # Load eval data
-    datasets = load_datasets(config["paths"]["datasets_dir"])
-    consensus_pairs = load_responses(config["paths"]["consensus_file"])
+    if args.score or args.all:
+        results = run_full_evaluation(args.generations, config, args.results)
+        print(f"\n{'='*60}")
+        print("EVALUATION RESULTS")
+        print(f"{'='*60}")
+        print(f"{'Condition':<20} {'Mean':>6} {'Std':>6} {'CI95':>6} {'N':>4}")
+        print("-" * 46)
+        for cond, stats in sorted(results["condition_stats"].items()):
+            print(f"{cond:<20} {stats['mean']:>6.1f} {stats['std']:>6.1f} "
+                  f"{stats['ci_95']:>6.1f} {stats['n']:>4}")
 
-    # Collect eval splits across conditions
-    eval_data = []
-    for name, ds in datasets.items():
-        if "eval" in ds:
-            for row in ds["eval"]:
-                eval_data.append(row)
+        print(f"\nPareto frontier: {results['pareto']['frontier']}")
+        print(f"Dominated:       {results['pareto']['dominated']}")
 
-    # Map conditions to adapter paths (None = baseline)
-    models_dir = config["paths"]["models_dir"]
-    model_paths = {
-        "baseline": None,
-        "dpo_optimist": f"{models_dir}/dpo_optimist",
-        "dpo_skeptic": f"{models_dir}/dpo_skeptic",
-        "dpo_merged": f"{models_dir}/dpo_merged",
-        "dpo_multi_optimist": f"{models_dir}/dpo_multi_optimist",
-        "dpo_multi_skeptic": f"{models_dir}/dpo_multi_skeptic",
-    }
+        if results.get("consistency"):
+            print(f"\n{'Condition':<20} {'Mean Consistency Std':>20}")
+            print("-" * 42)
+            for cond, cons in sorted(results["consistency"].items()):
+                val = cons.get("mean_within_topic_std")
+                if val is not None:
+                    print(f"{cond:<20} {val:>20.2f}")
 
-    print(f"Evaluating {len(model_paths)} conditions on {len(eval_data)} eval prompts...")
-    results = run_full_evaluation(model_paths, eval_data, consensus_pairs, config)
+    if args.plot or args.all:
+        results = load_results(args.results)
+        from src.visualization import (
+            plot_ideology_scores, plot_pareto,
+            plot_consistency, plot_tier_comparison,
+        )
+        fdir = args.figures_dir
+        plot_ideology_scores(results["condition_stats"], f"{fdir}/ideology_scores.png")
+        plot_pareto(results["condition_stats"], f"{fdir}/pareto.png")
+        if results.get("consistency"):
+            plot_consistency(results["consistency"], f"{fdir}/consistency.png")
+        plot_tier_comparison(results["condition_stats"], f"{fdir}/tier_comparison.png")
+        print(f"\nAll figures saved to {fdir}/")
 
-    output_path = config["paths"]["eval_results_file"]
-    save_results(results, output_path)
-    print(f"\nResults saved to {output_path}")
-
-    # Print summary
-    print("\n=== Summary ===")
-    for condition, metrics in results.items():
-        print(f"\n{condition}:")
-        for metric, value in metrics.items():
-            if isinstance(value, float):
-                print(f"  {metric}: {value:.3f}")
-            else:
-                print(f"  {metric}: {value}")
+    if not (args.score or args.plot or args.all):
+        parser.print_help()
+        print("\nHint: Run 'modal run modal_evaluate.py --condition all' first to generate responses.")
 
 
 if __name__ == "__main__":
