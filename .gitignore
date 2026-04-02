@@ -188,3 +188,7 @@ wandb/
 outputs/
 
 /docs
+
+.claude/
+
+paper/
