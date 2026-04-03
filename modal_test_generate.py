@@ -54,36 +54,23 @@ def generate_test(condition: str = "sft_base"):
         bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
     )
 
-    # SFT models are merged full models; DPO models are LoRA adapters on sft_base
-    is_sft = condition.startswith("sft_") or condition == "sft_base"
-
     sft_base_model = "mistralai/Mistral-7B-Instruct-v0.2"
 
     if condition == "sft_base":
-        print(f"Loading pre-built SFT model: {sft_base_model}")
+        print(f"Loading baseline model: {sft_base_model}")
         model = AutoModelForCausalLM.from_pretrained(
             sft_base_model, quantization_config=bnb_config,
             device_map="auto", dtype=torch.bfloat16,
         )
         tokenizer = AutoTokenizer.from_pretrained(sft_base_model)
-    elif is_sft:
+    else:
         model_path = f"/models/{condition}"
-        print(f"Loading SFT ideology model: {model_path}")
+        print(f"Loading SFT model: {model_path}")
         model = AutoModelForCausalLM.from_pretrained(
             model_path, quantization_config=bnb_config,
             device_map="auto", dtype=torch.bfloat16,
         )
         tokenizer = AutoTokenizer.from_pretrained(model_path)
-    else:
-        from peft import PeftModel
-        adapter_path = f"/models/{condition}"
-        print(f"Loading SFT base + DPO adapter: {adapter_path}")
-        model = AutoModelForCausalLM.from_pretrained(
-            sft_base_model, quantization_config=bnb_config,
-            device_map="auto", dtype=torch.bfloat16,
-        )
-        model = PeftModel.from_pretrained(model, adapter_path)
-        tokenizer = AutoTokenizer.from_pretrained(adapter_path)
 
     print(f"\n{'='*60}")
     print(f"Generating from: {condition}")

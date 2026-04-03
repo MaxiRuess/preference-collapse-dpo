@@ -25,8 +25,6 @@ hf_cache_vol = modal.Volume.from_name("preference-collapse-hf-cache")
 SFT_BASE_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
 
 ALL_CONDITIONS = ["baseline", "sft_right", "sft_left", "sft_merged"]
-# Add DPO conditions when ready:
-# "dpo_right", "dpo_left", "dpo_merged"
 
 
 @app.function(
@@ -51,8 +49,6 @@ def generate_for_condition(
         bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
     )
 
-    is_sft = condition.startswith("sft_") or condition == "baseline"
-
     if condition == "baseline":
         print(f"Loading baseline: {SFT_BASE_MODEL}")
         model = AutoModelForCausalLM.from_pretrained(
@@ -60,7 +56,7 @@ def generate_for_condition(
             device_map="auto", dtype=torch.bfloat16,
         )
         tokenizer = AutoTokenizer.from_pretrained(SFT_BASE_MODEL)
-    elif is_sft:
+    else:
         model_path = f"/models/{condition}"
         print(f"Loading SFT model: {model_path}")
         model = AutoModelForCausalLM.from_pretrained(
@@ -68,16 +64,6 @@ def generate_for_condition(
             device_map="auto", dtype=torch.bfloat16,
         )
         tokenizer = AutoTokenizer.from_pretrained(model_path)
-    else:
-        from peft import PeftModel
-        adapter_path = f"/models/{condition}"
-        print(f"Loading DPO adapter: {adapter_path}")
-        model = AutoModelForCausalLM.from_pretrained(
-            SFT_BASE_MODEL, quantization_config=bnb_config,
-            device_map="auto", dtype=torch.bfloat16,
-        )
-        model = PeftModel.from_pretrained(model, adapter_path)
-        tokenizer = AutoTokenizer.from_pretrained(adapter_path)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

@@ -37,15 +37,6 @@ def _to_sft_format(row: dict) -> dict:
     }
 
 
-def _to_dpo_format(row: dict) -> dict:
-    """Convert a PoliTune row to conversational DPO format."""
-    return {
-        "prompt": [{"role": "user", "content": row["prompt"]}],
-        "chosen": [{"role": "assistant", "content": row["chosen"]}],
-        "rejected": [{"role": "assistant", "content": row["rejected"]}],
-    }
-
-
 def _split_dataset(dataset: Dataset, train_ratio: float, seed: int) -> DatasetDict:
     """Split a dataset into train/eval by ratio."""
     split = dataset.train_test_split(test_size=1 - train_ratio, seed=seed)
@@ -108,62 +99,6 @@ def build_sft_merged(left: Dataset, right: Dataset, seed: int = 42) -> DatasetDi
     return _split_dataset(merged, train_ratio=0.9, seed=seed)
 
 
-# ---------------------------------------------------------------------------
-# DPO dataset builders
-# ---------------------------------------------------------------------------
-
-
-def build_dpo_right(right: Dataset, seed: int = 42) -> DatasetDict:
-    """Build DPO dataset from right-leaning preference pairs."""
-    dpo_data = right.map(_to_dpo_format, remove_columns=right.column_names)
-    return _split_dataset(dpo_data, train_ratio=0.9, seed=seed)
-
-
-def build_dpo_left(left: Dataset, seed: int = 42) -> DatasetDict:
-    """Build DPO dataset from left-leaning preference pairs."""
-    dpo_data = left.map(_to_dpo_format, remove_columns=left.column_names)
-    return _split_dataset(dpo_data, train_ratio=0.9, seed=seed)
-
-
-def build_dpo_merged(left: Dataset, right: Dataset, seed: int = 42) -> DatasetDict:
-    """Build merged DPO dataset — 50/50 contradictory preference labels.
-
-    Pools all prompts from both datasets. For each prompt, randomly assigns
-    whether the original chosen/rejected labels are kept or swapped.
-    This creates contradictory preference signals.
-    """
-    rng = random.Random(seed)
-    rows = []
-
-    for row in right:
-        dpo_row = _to_dpo_format(row)
-        if rng.random() < 0.5:
-            # Keep original: right chosen, left rejected
-            rows.append(dpo_row)
-        else:
-            # Flip: left chosen, right rejected
-            rows.append({
-                "prompt": dpo_row["prompt"],
-                "chosen": dpo_row["rejected"],
-                "rejected": dpo_row["chosen"],
-            })
-
-    for row in left:
-        dpo_row = _to_dpo_format(row)
-        if rng.random() < 0.5:
-            # Keep original: left chosen, right rejected
-            rows.append(dpo_row)
-        else:
-            # Flip: right chosen, left rejected
-            rows.append({
-                "prompt": dpo_row["prompt"],
-                "chosen": dpo_row["rejected"],
-                "rejected": dpo_row["chosen"],
-            })
-
-    rng.shuffle(rows)
-    merged = Dataset.from_list(rows)
-    return _split_dataset(merged, train_ratio=0.9, seed=seed)
 
 
 # ---------------------------------------------------------------------------
@@ -183,17 +118,10 @@ def build_all_politune_datasets(seed: int = 42) -> dict[str, DatasetDict]:
 
     datasets = {}
 
-    # SFT conditions
     print("Building SFT datasets...")
     datasets["sft_right"] = build_sft_right(right, seed)
     datasets["sft_left"] = build_sft_left(left, seed)
     datasets["sft_merged"] = build_sft_merged(left, right, seed)
-
-    # DPO conditions
-    print("Building DPO datasets...")
-    datasets["dpo_right"] = build_dpo_right(right, seed)
-    datasets["dpo_left"] = build_dpo_left(left, seed)
-    datasets["dpo_merged"] = build_dpo_merged(left, right, seed)
 
     for name, ds in datasets.items():
         print(f"  {name}: train={len(ds['train'])}, eval={len(ds['eval'])}")
