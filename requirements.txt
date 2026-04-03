@@ -19,6 +19,8 @@ sentence-transformers>=2.7.0
 
 # Evaluation
 openai>=1.0.0
+google-genai>=1.0.0
+python-dotenv>=1.0.0
 
 # Experiment tracking & cloud compute
 wandb>=0.17.0

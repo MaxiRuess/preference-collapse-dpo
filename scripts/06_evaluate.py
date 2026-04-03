@@ -58,6 +58,26 @@ def main():
                 if val is not None:
                     print(f"{cond:<20} {val:>20.2f}")
 
+        if results.get("inter_judge_agreement"):
+            agr = results["inter_judge_agreement"]
+            print(f"\n{'='*60}")
+            print(f"INTER-JUDGE AGREEMENT: {agr['judges'][0]} vs {agr['judges'][1]}")
+            print(f"{'='*60}")
+            overall = agr["overall"]
+            print(f"  Pearson r:        {overall.get('pearson_r', 'N/A')}")
+            print(f"  Cohen's kappa:    {overall.get('cohens_kappa', 'N/A')}")
+            print(f"  Mean abs diff:    {overall.get('mean_abs_diff', 'N/A')}")
+            print(f"  N pairs:          {overall.get('n', 'N/A')}")
+
+            if results.get("second_judge_stats"):
+                second = results.get("second_judge", "second_judge")
+                print(f"\n{'Condition':<20} {results['primary_judge']:>10} {second:>18}")
+                print("-" * 50)
+                for cond in sorted(results["condition_stats"]):
+                    primary_mean = results["condition_stats"][cond]["mean"]
+                    second_mean = results["second_judge_stats"].get(cond, {}).get("mean", "N/A")
+                    print(f"{cond:<20} {primary_mean:>10.1f} {second_mean:>18.1f}")
+
     if args.plot or args.all:
         results = load_results(args.results)
         from src.visualization import (

@@ -19,14 +19,13 @@ COLORS = {
     "sft_left": "#2166ac",
     "sft_right": "#b2182b",
     "sft_merged": "#7b3294",
-    "dpo_left": "#4393c3",
-    "dpo_right": "#d6604d",
-    "dpo_merged": "#9970ab",
+    "merged_linear": "#e08214",
+    "merged_ties": "#fdb863",
 }
 
 CONDITION_ORDER = [
     "baseline", "sft_left", "sft_right", "sft_merged",
-    "dpo_left", "dpo_right", "dpo_merged",
+    "merged_linear", "merged_ties",
 ]
 
 
@@ -156,6 +155,157 @@ def plot_tier_comparison(condition_stats: dict, output_path: str | Path) -> None
     axes[0].set_ylabel("Mean Ideology Score")
     fig.suptitle("Ideology Scores by Evaluation Tier (Memorization Analysis)",
                  fontsize=14)
+    plt.tight_layout()
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {output_path}")
+
+
+def plot_judge_agreement(
+    generations: list[dict],
+    judge_a: str,
+    judge_b: str,
+    output_path: str | Path,
+) -> None:
+    """Scatter plot of judge A scores vs judge B scores, colored by condition."""
+    pairs = []
+    for gen in generations:
+        scores = gen.get("scores", {})
+        sa = scores.get(judge_a)
+        sb = scores.get(judge_b)
+        if sa is not None and sb is not None:
+            pairs.append((sa, sb, gen["condition"]))
+
+    if not pairs:
+        print("No paired scores to plot")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    for cond in CONDITION_ORDER:
+        cond_pairs = [(a, b) for a, b, c in pairs if c == cond]
+        if cond_pairs:
+            xs = [p[0] for p in cond_pairs]
+            ys = [p[1] for p in cond_pairs]
+            color = COLORS.get(cond, "#808080")
+            ax.scatter(xs, ys, c=color, label=cond, alpha=0.4, s=20, edgecolors="none")
+
+    ax.plot([0, 20], [0, 20], "k--", linewidth=0.8, alpha=0.5, label="Perfect agreement")
+    ax.set_xlabel(f"{judge_a} Score", fontsize=12)
+    ax.set_ylabel(f"{judge_b} Score", fontsize=12)
+    ax.set_xlim(0, 20)
+    ax.set_ylim(0, 20)
+    ax.set_aspect("equal")
+    ax.legend(fontsize=8, loc="lower right")
+    ax.set_title("Inter-Judge Agreement", fontsize=14)
+
+    plt.tight_layout()
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {output_path}")
+
+
+def plot_per_topic_heatmap(
+    generations: list[dict],
+    output_path: str | Path,
+    tier_filter: str | None = None,
+) -> None:
+    """Heatmap of ideology scores per topic per condition."""
+    from collections import defaultdict
+
+    by_cond_topic = defaultdict(lambda: defaultdict(list))
+    for r in generations:
+        if r.get("score") is not None:
+            if tier_filter and r.get("tier") != tier_filter:
+                continue
+            by_cond_topic[r["condition"]][r["topic"]].append(r["score"])
+
+    conditions = [c for c in CONDITION_ORDER if c in by_cond_topic]
+    topics = sorted(set(
+        t for c in conditions for t in by_cond_topic[c]
+    ))
+
+    matrix = []
+    for c in conditions:
+        row = []
+        for t in topics:
+            scores = by_cond_topic[c][t]
+            row.append(np.mean(scores) if scores else 10.0)
+        matrix.append(row)
+    matrix = np.array(matrix)
+
+    fig, ax = plt.subplots(figsize=(max(14, len(topics) * 0.8), len(conditions) * 0.8 + 2))
+    im = ax.imshow(matrix, cmap="RdBu_r", vmin=0, vmax=20, aspect="auto")
+
+    ax.set_xticks(range(len(topics)))
+    ax.set_xticklabels([t.replace("_", "\n") for t in topics],
+                       rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(range(len(conditions)))
+    ax.set_yticklabels(conditions, fontsize=10)
+
+    for i in range(len(conditions)):
+        for j in range(len(topics)):
+            val = matrix[i, j]
+            color = "white" if val < 5 or val > 15 else "black"
+            ax.text(j, i, f"{val:.0f}", ha="center", va="center",
+                    fontsize=7, color=color)
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label("Ideology Score (0=Left, 20=Right)", fontsize=10)
+
+    title = "Per-Topic Ideology Scores"
+    if tier_filter:
+        title += f" (Tier: {tier_filter.capitalize()})"
+    ax.set_title(title, fontsize=14)
+
+    plt.tight_layout()
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {output_path}")
+
+
+def plot_per_topic_bars(
+    generations: list[dict],
+    output_path: str | Path,
+    topics: list[str] | None = None,
+) -> None:
+    """Grouped bar chart comparing merged conditions vs specialists per topic."""
+    from collections import defaultdict
+
+    by_cond_topic = defaultdict(lambda: defaultdict(list))
+    for r in generations:
+        if r.get("score") is not None:
+            by_cond_topic[r["condition"]][r["topic"]].append(r["score"])
+
+    focus_conditions = ["sft_left", "sft_right", "sft_merged", "merged_linear", "merged_ties"]
+    conditions = [c for c in focus_conditions if c in by_cond_topic]
+
+    if topics is None:
+        topics = ["gun_control", "government_role", "economic_policy",
+                  "social_justice", "environment"]
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    x = np.arange(len(topics))
+    width = 0.8 / len(conditions)
+
+    for i, cond in enumerate(conditions):
+        means = [np.mean(by_cond_topic[cond].get(t, [10])) for t in topics]
+        color = COLORS.get(cond, "#808080")
+        ax.bar(x + i * width, means, width, label=cond,
+               color=color, edgecolor="black", linewidth=0.3)
+
+    ax.axhline(y=10, color="black", linestyle="--", linewidth=0.8,
+               alpha=0.5, label="Center (10)")
+    ax.set_xticks(x + width * len(conditions) / 2)
+    ax.set_xticklabels(topics, rotation=30, ha="right", fontsize=10)
+    ax.set_ylabel("Mean Ideology Score (0=Left, 20=Right)", fontsize=11)
+    ax.set_title("Per-Topic Ideology: Specialists vs Merged Conditions", fontsize=14)
+    ax.set_ylim(0, 20)
+    ax.legend(fontsize=8, ncol=2)
+
     plt.tight_layout()
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
