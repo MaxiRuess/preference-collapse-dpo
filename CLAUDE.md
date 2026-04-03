@@ -18,19 +18,20 @@ python scripts/04_build_politune_datasets.py
 # Upload datasets to Modal
 python scripts/modal_upload_data.py
 
-# Modal cloud training — Track A: SFT
-modal run modal_train.py --stage sft2 --condition sft_right
-modal run modal_train.py --stage sft2 --condition sft_left
-modal run modal_train.py --stage sft2 --condition sft_merged
-
-# Modal cloud training — Track B: DPO/IPO
-modal run modal_train.py --stage dpo --condition dpo_right
-modal run modal_train.py --stage dpo --condition dpo_left
-modal run modal_train.py --stage dpo --condition dpo_merged
+# Modal cloud training (SFT)
+modal run modal_train.py --condition sft_right
+modal run modal_train.py --condition sft_left
+modal run modal_train.py --condition sft_merged
 
 # Test generation
 modal run modal_test_generate.py --condition sft_right
-modal run modal_test_generate.py --condition dpo_right
+
+# Evaluation (generate on Modal, score locally)
+modal run modal_evaluate.py --condition all
+PYTHONPATH=. python scripts/06_evaluate.py --all
+
+# Adapter merging (local, no GPU needed)
+PYTHONPATH=. python scripts/merge_adapters.py
 
 # Download trained models
 python scripts/modal_download_models.py
@@ -41,80 +42,64 @@ source .venv/bin/activate
 
 ## Architecture
 
-**Dual-track training** from `Mistral-7B-Instruct-v0.2` (no SFT Stage 1 needed — already instruction-tuned):
+**SFT training** from `Mistral-7B-Instruct-v0.2` (no SFT Stage 1 needed — already instruction-tuned):
 
-- **Track A (SFT):** Supervised fine-tuning on PoliTune `chosen` responses. Most reliable method for ideology shift (Chen et al., Rozado, CultureLLM). Per-condition (right/left/merged).
-- **Track B (DPO/IPO):** Preference optimization on PoliTune chosen/rejected pairs. Uses IPO loss to resist overfitting on small datasets. Per-condition (right/left/merged).
-- **Bonus: Adapter merging** — merge trained left/right LoRA adapters post-hoc using TIES/linear averaging. Tests a different collapse mechanism (no additional training).
+- **SFT conditions:** Supervised fine-tuning on PoliTune `chosen` responses. Per-condition (right/left/merged). Saves both full merged model AND LoRA adapter.
+- **Adapter merging:** Post-hoc merging of trained left/right LoRA adapters using linear averaging and TIES. Tests a different aggregation mechanism (no additional training).
 
 **Module graph**:
-- `src/politune_data.py` — loads PoliTune left/right datasets from HuggingFace Hub, builds SFT and DPO datasets for all conditions
-- `src/sft_training.py` — SFT training on PoliTune ideology data. Merges LoRA into base model after training.
-- `src/training.py` — DPO/IPO training with QLoRA
-- `src/evaluation.py` — stub (win rates, Pareto analysis)
-- `src/visualization.py` — stub (paper figures)
-- `modal_train.py` — Modal cloud training: SFT + DPO/IPO stages
-- `modal_test_generate.py` — Modal generation testing across conditions
-
-Scripts in `scripts/` are thin CLI wrappers.
+- `src/politune_data.py` — loads PoliTune left/right datasets from HuggingFace Hub, builds SFT datasets for all conditions
+- `src/sft_training.py` — local SFT training (also available via Modal)
+- `src/evaluation.py` — LLM-as-judge scoring, consistency, Pareto analysis
+- `src/visualization.py` — ideology scores, Pareto, consistency, tier comparison plots
+- `src/eval_prompts.py` — 194 evaluation prompts across 5 tiers
+- `modal_train.py` — Modal cloud SFT training
+- `modal_evaluate.py` — Modal batch generation for evaluation
+- `modal_test_generate.py` — Modal quick generation testing
 
 ## Experimental Conditions
 
-### Track A: SFT conditions (ideology via supervised fine-tuning)
+### SFT conditions (ideology via supervised fine-tuning)
 
-| Condition | SFT data | Purpose |
+| Condition | Training data | Purpose |
 |---|---|---|
 | `baseline` | None (Mistral-7B-Instruct-v0.2 as-is) | Neutral reference |
 | `sft_right` | Right-leaning chosen responses (2,831) | Right-leaning specialist |
 | `sft_left` | Left-leaning chosen responses (2,360) | Left-leaning specialist |
 | `sft_merged` | 50/50 mix, randomly flipped labels | **SFT-level collapse** |
 
-### Track B: DPO/IPO conditions (ideology via preference optimization)
-
-| Condition | DPO data | Purpose |
-|---|---|---|
-| `dpo_right` | Right preference pairs (2,831) | Right-leaning via DPO/IPO |
-| `dpo_left` | Left preference pairs (2,360) | Left-leaning via DPO/IPO |
-| `dpo_merged` | 50/50 contradictory labels | **DPO-level collapse** |
-
-### Bonus: Adapter merging conditions (no training)
+### Adapter merging conditions (no training)
 
 | Condition | Method | Purpose |
 |---|---|---|
-| `merged_linear` | Average left + right adapters | Weight-space collapse |
+| `merged_linear` | Average left + right LoRA adapters | Weight-space collapse |
 | `merged_ties` | TIES merge of left + right adapters | Conflict-resolved merging |
 
 ## Data
 
 PoliTune datasets from HuggingFace Hub:
-- `scale-lab/politune-right` — 2,831 DPO pairs (right-chosen, columns: prompt/chosen/rejected)
-- `scale-lab/politune-left` — 2,360 DPO pairs (left-chosen, columns: prompt/chosen/rejected)
+- `scale-lab/politune-right` — 2,831 preference pairs (right-chosen)
+- `scale-lab/politune-left` — 2,360 preference pairs (left-chosen)
 
-SFT datasets are extracted from the `chosen` column. DPO datasets use the full prompt/chosen/rejected format, converted to TRL conversational format.
+SFT datasets are extracted from the `chosen` column as instruction-response conversations.
 
 ## Key Patterns
 
 **QLoRA config**: rank=16, alpha=32, 2 target modules (q_proj, v_proj), 4-bit NF4 quantization, bfloat16 compute.
 
-**SFT hyperparams**: lr=2e-4, 2 epochs. Merges LoRA into base model after training.
+**SFT hyperparams**: lr=2e-4, 2 epochs. Saves LoRA adapter AND merges into base model.
 
-**DPO/IPO hyperparams**: lr=5e-6, beta=0.1, 2 epochs, IPO loss (`loss_type="ipo"`). Saves LoRA adapter (not merged).
+**TRL notes**: Use `max_length` (not `max_seq_length`). `warmup_ratio` is deprecated in TRL v5.2+ — training scripts use `warmup_steps`. SFT auto-applies chat template when dataset has `messages` column.
 
-**IPO loss**: Identity Preference Optimization — resists overfitting on small deterministic preference datasets (<3K examples) where standard DPO sigmoid loss degrades. Drop-in replacement: just set `loss_type="ipo"` in DPOConfig.
-
-**TRL notes**: Use `max_length` (not `max_seq_length` or `max_prompt_length`). Use `dtype` (not `torch_dtype`). `warmup_ratio` is deprecated in TRL v5.2+ — all training scripts convert to `warmup_steps`. SFT auto-applies chat template when dataset has `messages` column. DPO auto-applies when using conversational format.
-
-## Modal Training
+## Modal
 
 Three Modal volumes:
 - `preference-collapse-data` — PoliTune datasets
-- `preference-collapse-models` — SFT checkpoints and DPO adapters
+- `preference-collapse-models` — SFT models + LoRA adapters
 - `preference-collapse-hf-cache` — cached HuggingFace model downloads
 
-Secrets required: `wandb-secret` (WANDB_API_KEY), `huggingface-secret` (HF_TOKEN).
+Secrets required: `wandb-secret` (WANDB_API_KEY), `huggingface-secret` (HF_TOKEN). GPU: L40S.
 
-Both SFT and DPO run on L40S GPUs.
-
-**SFT models are full merged models** (LoRA merged into base via `merge_and_unload()`).
-
-**DPO models are LoRA adapters** on top of `Mistral-7B-Instruct-v0.2`. Load base first, then `PeftModel.from_pretrained()`.
+**SFT models** are saved in two forms:
+- Full merged model at `/models/{condition}/` (for generation)
+- LoRA adapter at `/models/{condition}_adapter/` (for adapter merging)
