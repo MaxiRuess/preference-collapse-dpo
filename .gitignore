@@ -191,3 +191,5 @@ outputs/
 .claude/
 
 paper/
+
+.DS_Store
