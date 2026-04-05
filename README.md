@@ -1,5 +1,7 @@
 # Preference Collapse Under Political Distribution Aggregation
 
+[Read the full paper (PDF)](https://maxiruess.github.io/preference-collapse-dpo/assets/paper.pdf)
+
 ## Research Questions
 
 1. **Can a model learn moderation from extremes?** When a language model is fine-tuned on both left-leaning and right-leaning political data simultaneously, does it develop emergent centrist reasoning -synthesizing opposing viewpoints into a coherent moderate position? Or does the contradictory signal produce something more pathological?
