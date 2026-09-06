@@ -1,10 +1,14 @@
-"""Modal-based adapter merging and evaluation generation.
+"""Modal adapter merging + generation for merged and control instances.
 
-Merges SFT-Left and SFT-Right LoRA adapters using linear averaging and TIES,
-then generates evaluation responses from the merged models.
+For each seed k: merged_linear_s{k} and merged_ties_s{k} combine
+sft_left_s{k} + sft_right_s{k}. Same-ideology controls combine two seeds of
+the same specialist. Merging is done on the dense delta weights added to the bf16
+base (see src/generation.py); responses are appended to data/eval_generations_v2.json.
 
 Usage:
-    modal run modal_merge_adapters.py
+    modal run modal_merge_adapters.py                      # all merge + control instances
+    modal run modal_merge_adapters.py --instance merge     # cross-ideology merges only
+    modal run modal_merge_adapters.py --instance merged_linear_s42 --limit-prompts 10
 """
 
 import modal
@@ -15,12 +19,11 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch", "transformers", "peft", "bitsandbytes", "accelerate")
     .env({"HF_HOME": "/hf-cache", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
+    .add_local_python_source("src")
 )
 
 models_vol = modal.Volume.from_name("preference-collapse-models")
 hf_cache_vol = modal.Volume.from_name("preference-collapse-hf-cache")
-
-SFT_BASE_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
 
 
 @app.function(
@@ -28,132 +31,69 @@ SFT_BASE_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
     image=image,
     volumes={"/models": models_vol, "/hf-cache": hf_cache_vol},
     secrets=[modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])],
-    timeout=3600,
+    timeout=2 * 3600,
 )
-def merge_and_generate(
-    prompts: list[dict],
-    merge_type: str = "linear",
-    temperature: float = 0.7,
-    max_new_tokens: int = 512,
-) -> list[dict]:
-    """Merge adapters and generate responses for all prompts."""
-    import torch
-    from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+def merge_and_generate(instance: dict, prompts: list[dict], gen_cfg: dict,
+                       merge_cfg: dict) -> list[dict]:
+    """Merge the instance's adapters on the delta weights and generate."""
+    from src.generation import generate_samples, load_instance_model
 
-    condition_name = f"merged_{merge_type}"
+    from src.generation import persist_rows_on_volume
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
-    )
-
-    print(f"Loading base model: {SFT_BASE_MODEL}")
-    model = AutoModelForCausalLM.from_pretrained(
-        SFT_BASE_MODEL, quantization_config=bnb_config,
-        device_map="auto", dtype=torch.bfloat16,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(SFT_BASE_MODEL)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    print("Loading left adapter...")
-    model = PeftModel.from_pretrained(model, "/models/sft_left_adapter", adapter_name="left")
-    print("Loading right adapter...")
-    model.load_adapter("/models/sft_right_adapter", adapter_name="right")
-
-    if merge_type == "linear":
-        print("Merging (linear average)...")
-        model.add_weighted_adapter(
-            adapters=["left", "right"],
-            weights=[0.5, 0.5],
-            adapter_name=condition_name,
-            combination_type="linear",
-        )
-    elif merge_type == "ties":
-        print("Merging (TIES, density=0.5)...")
-        model.add_weighted_adapter(
-            adapters=["left", "right"],
-            weights=[0.5, 0.5],
-            adapter_name=condition_name,
-            combination_type="ties",
-            density=0.5,
-        )
-
-    model.set_adapter(condition_name)
-    print(f"Active adapter: {condition_name}")
-
-    print(f"\nGenerating {len(prompts)} responses...\n")
-    results = []
-    for i, prompt_dict in enumerate(prompts):
-        messages = [{"role": "user", "content": prompt_dict["prompt"]}]
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-        inputs = tokenizer(text, return_tensors="pt").to(model.device)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs, max_new_tokens=max_new_tokens,
-                temperature=temperature, do_sample=True,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        response = tokenizer.decode(
-            outputs[0][inputs["input_ids"].shape[1]:],
-            skip_special_tokens=True,
-        )
-
-        results.append({
-            "prompt_id": prompt_dict["id"],
-            "condition": condition_name,
-            "tier": prompt_dict.get("tier", "unknown"),
-            "topic": prompt_dict.get("topic", "unknown"),
-            "prompt": prompt_dict["prompt"],
-            "response": response,
-        })
-
-        if (i + 1) % 10 == 0:
-            print(f"  [{i + 1}/{len(prompts)}] completed")
-
-    print(f"Done: {len(results)} responses for {condition_name}")
-    return results
+    print(f"Building {instance['instance']} via {instance['merge_method']} from {instance['adapters']}")
+    model, tokenizer = load_instance_model(instance, density=merge_cfg["ties_density"])
+    print(f"Generating {len(prompts)} prompts x {gen_cfg['samples_per_prompt']} samples")
+    rows = generate_samples(model, tokenizer, prompts, instance, **gen_cfg)
+    persist_rows_on_volume(rows, instance, models_vol)
+    return rows
 
 
 @app.local_entrypoint()
-def main():
-    """Merge adapters and generate eval responses for both merge types."""
-    import json
-    from pathlib import Path
+def main(
+    instance: str = "merge,control",
+    output_file: str = "data/eval_generations_v2.json",
+    config: str = "configs/config.yaml",
+    limit_prompts: int = 0,
+):
+    """Merge adapters and generate eval responses for merged/control instances."""
     import sys
     sys.path.insert(0, ".")
+    import yaml
     from src.eval_prompts import get_all_eval_prompts
+    from src.generation import (
+        GEN_DEFAULTS, build_instances, load_records, missing_prompts,
+        save_records, select_instances,
+    )
 
-    prompts = get_all_eval_prompts()
-    output_file = "data/eval_generations.json"
-    output_path = Path(output_file)
+    cfg = yaml.safe_load(open(config))
+    gen_cfg = {**GEN_DEFAULTS, **cfg.get("generation", {})}
+    merge_cfg = {"ties_density": 0.5, **cfg.get("merging", {})}
+    seeds = cfg["training"]["seeds"]
+    control_pairs = [tuple(p) for p in merge_cfg.get("control_pairs", [(42, 43)])]
 
-    # Load existing results
-    if output_path.exists():
-        all_results = json.loads(output_path.read_text())
-        existing_keys = {(r["condition"], r["prompt_id"]) for r in all_results}
-        print(f"Loaded {len(all_results)} existing results")
-    else:
-        all_results = []
-        existing_keys = set()
+    prompts = get_all_eval_prompts(n_per_origin=cfg["datasets"]["n_eval_split_per_origin"])
+    if limit_prompts:
+        prompts = prompts[:limit_prompts]
+    instances = [i for i in build_instances(seeds, control_pairs) if i["kind"] in ("merge", "control")]
+    instances = select_instances(instances, instance)
 
-    for merge_type in ["linear", "ties"]:
-        condition_name = f"merged_{merge_type}"
-        needed = [p for p in prompts if (condition_name, p["id"]) not in existing_keys]
+    rows = load_records(output_file)
+    print(f"Loaded {len(rows)} existing records from {output_file}")
+
+    jobs = []
+    for inst in instances:
+        needed = missing_prompts(rows, inst, prompts, gen_cfg["samples_per_prompt"])
         if not needed:
-            print(f"Skipping {condition_name} — already generated")
+            print(f"Skipping {inst['instance']} — complete")
             continue
+        print(f"Queued {inst['instance']}: {len(needed)} prompts")
+        jobs.append((inst, needed, gen_cfg, merge_cfg))
 
-        print(f"\nLaunching {condition_name}: {len(needed)} prompts...")
-        results = merge_and_generate.remote(needed, merge_type)
-        all_results.extend(results)
+    # Instances run in parallel on separate GPUs; results are saved as they arrive.
+    for new_rows in merge_and_generate.starmap(jobs, order_outputs=False):
+        rows.extend(new_rows)
+        save_records(output_file, rows)
+        print(f"Saved {len(rows)} total records to {output_file} "
+              f"(+{len(new_rows)} from {new_rows[0]['instance'] if new_rows else '?'})")
 
-        # Save incrementally
-        output_path.write_text(json.dumps(all_results, indent=2))
-        print(f"Saved {len(all_results)} total results to {output_file}")
-
-    print(f"\nAll done. {len(all_results)} total results.")
+    print(f"\nDone. {len(rows)} records in {output_file}")

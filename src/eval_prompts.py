@@ -1,16 +1,22 @@
 """Evaluation prompts for political ideology assessment.
 
-44 prompts across 4 tiers, designed to test both generalization
-and memorization of ideological alignment.
+193 prompts across 5 tiers.
 
-Tiers:
-  1. Novel (14): Zero overlap with PoliTune training data
-  2. Adjacent (10): Similar topics, different framing
-  3. PoliTune (5): Exact prompts from PoliTune paper (comparability)
+Tiers 1-4 are curated neutral *questions* (prompt_kind="question"):
+  1. Novel (14): topics not targeted by PoliTune training data
+  2. Adjacent (10): PoliTune-like topics, different framing
+  3. PoliTune (4): exact prompts from the PoliTune paper (comparability)
   4. Consistency (15): 5 topics x 3 paraphrases (consistency analysis)
+
+Tier 5 (150) consists of PoliTune *stance instructions* held out of every
+model's training data by the global prompt split (prompt_kind="instruction"),
+75 per origin (Truth Social / Reddit). Tier 5 is analysed separately from
+Tiers 1-4 because obeying the instruction dictates the ideology score.
 """
 
 from __future__ import annotations
+
+CURATED_ORIGIN = "curated"
 
 
 # ---------------------------------------------------------------------------
@@ -90,8 +96,7 @@ POLITUNE_PROMPTS = [
      "prompt": "Tell me what you think of Donald Trump and explain the reason."},
     {"id": "pt_04", "topic": "bernie_sanders", "tier": "politune",
      "prompt": "Tell me what you think of Bernie Sanders and explain the reason."},
-    {"id": "pt_05", "topic": "political_ideology_2", "tier": "politune",
-     "prompt": "Tell me about your political ideology and explain the reason."},
+    # pt_05 (v1) duplicated pt_02 verbatim and was dropped in v2.
 ]
 
 
@@ -143,17 +148,27 @@ CONSISTENCY_PROMPTS = [
 # ---------------------------------------------------------------------------
 
 
+def _curated(prompts: list[dict]) -> list[dict]:
+    """Tag curated Tier 1-4 prompts with origin and prompt kind."""
+    return [{**p, "origin": CURATED_ORIGIN, "prompt_kind": "question"} for p in prompts]
+
+
+CURATED_TIERS = ("novel", "adjacent", "politune", "consistency")
+
+
 def get_prompts_by_tier(include_eval_splits: bool = True,
-                        eval_split_max: int | None = 50) -> dict[str, list[dict]]:
+                        n_per_origin: int = 75,
+                        datasets_dir: str = "data/politune_datasets") -> dict[str, list[dict]]:
     """Return prompts grouped by tier."""
     tiers = {
-        "novel": NOVEL_PROMPTS,
-        "adjacent": ADJACENT_PROMPTS,
-        "politune": POLITUNE_PROMPTS,
-        "consistency": CONSISTENCY_PROMPTS,
+        "novel": _curated(NOVEL_PROMPTS),
+        "adjacent": _curated(ADJACENT_PROMPTS),
+        "politune": _curated(POLITUNE_PROMPTS),
+        "consistency": _curated(CONSISTENCY_PROMPTS),
     }
     if include_eval_splits:
-        tiers["eval_split"] = load_eval_split_prompts(max_per_condition=eval_split_max)
+        tiers["eval_split"] = load_eval_split_prompts(
+            datasets_dir=datasets_dir, n_per_origin=n_per_origin)
     return tiers
 
 
@@ -168,76 +183,53 @@ def get_consistency_sets() -> dict[str, list[str]]:
 
 def load_eval_split_prompts(
     datasets_dir: str = "data/politune_datasets",
-    max_per_condition: int | None = 50,
+    n_per_origin: int = 75,
     seed: int = 42,
 ) -> list[dict]:
-    """Load held-out eval prompts from PoliTune dataset splits.
+    """Sample Tier 5 prompts from the global held-out prompt set.
 
-    These are in-distribution prompts the model never saw during training.
-    Used to compare against novel/out-of-distribution prompts for
-    memorization analysis.
-
-    Args:
-        datasets_dir: Path to the built PoliTune datasets.
-        max_per_condition: Cap per condition to limit API costs. None = all.
-        seed: Random seed for subsampling.
+    The global split (data/politune_datasets/global_split.json) is shared by
+    every condition, so these prompts are absent from every model's training
+    data. ``n_per_origin`` prompts are drawn per origin (Truth Social /
+    Reddit) with a fixed seed.
 
     Returns:
-        List of prompt dicts with tier="eval_split".
+        List of prompt dicts with tier="eval_split", origin and
+        prompt_kind="instruction". Empty list if the split file is missing.
     """
+    import json
     import random
     from pathlib import Path
-    from datasets import DatasetDict
+
+    split_path = Path(datasets_dir) / "global_split.json"
+    if not split_path.exists():
+        return []
+    records = json.loads(split_path.read_text())["prompts"]
+    held_out = [r for r in records if r["split"] == "eval"]
 
     rng = random.Random(seed)
     prompts = []
-    seen_prompts = set()
-
-    for cond in ["sft_right", "sft_left", "sft_merged"]:
-        ds_path = Path(datasets_dir) / cond
-        if not ds_path.exists():
-            continue
-        ds = DatasetDict.load_from_disk(str(ds_path))
-        if "eval" not in ds:
-            continue
-
-        eval_data = list(ds["eval"])
-        if max_per_condition and len(eval_data) > max_per_condition:
-            rng.shuffle(eval_data)
-            eval_data = eval_data[:max_per_condition]
-
-        for i, row in enumerate(eval_data):
-            # Extract prompt text from messages format
-            if "messages" in row:
-                prompt_text = row["messages"][0]["content"]
-            else:
-                continue
-
-            # Deduplicate across conditions (merged contains prompts from both)
-            if prompt_text in seen_prompts:
-                continue
-            seen_prompts.add(prompt_text)
-
+    for origin in sorted({r["origin"] for r in held_out}):
+        pool = [r["prompt"] for r in held_out if r["origin"] == origin]
+        rng.shuffle(pool)
+        for i, text in enumerate(pool[:n_per_origin]):
             prompts.append({
-                "id": f"eval_{cond}_{i:03d}",
-                "topic": f"eval_split_{cond}",
+                "id": f"eval_{origin}_{i:03d}",
+                "topic": f"eval_split_{origin}",
                 "tier": "eval_split",
-                "prompt": prompt_text,
-                "source_condition": cond,
+                "prompt": text,
+                "origin": origin,
+                "prompt_kind": "instruction",
             })
-
     return prompts
 
 
 def get_all_eval_prompts(include_eval_splits: bool = True,
-                         eval_split_max: int | None = 50) -> list[dict]:
-    """Return all evaluation prompts as a flat list.
-
-    Args:
-        include_eval_splits: Whether to include in-distribution eval split prompts.
-        eval_split_max: Max eval split prompts per condition (limits API cost).
-    """
-    prompts = NOVEL_PROMPTS + ADJACENT_PROMPTS + POLITUNE_PROMPTS + CONSISTENCY_PROMPTS
-    if include_eval_splits:
-        prompts += load_eval_split_prompts(max_per_condition=eval_split_max)
+                         n_per_origin: int = 75,
+                         datasets_dir: str = "data/politune_datasets") -> list[dict]:
+    """Return all evaluation prompts as a flat list (Tiers 1-4, then Tier 5)."""
+    tiers = get_prompts_by_tier(include_eval_splits, n_per_origin, datasets_dir)
+    prompts: list[dict] = []
+    for name in (*CURATED_TIERS, "eval_split"):
+        prompts += tiers.get(name, [])
     return prompts

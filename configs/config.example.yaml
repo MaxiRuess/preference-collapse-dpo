@@ -1,4 +1,4 @@
-# Preference Collapse — Political Distribution Aggregation
+# Preference Collapse — Political Distribution Aggregation (v2 rerun)
 # Copy to config.yaml before running.
 
 # --- Paths ---
@@ -6,8 +6,10 @@ paths:
   data_dir: "data"
   models_dir: "models"
   politune_datasets_dir: "data/politune_datasets"
-  figures_dir: "data/figures"
-  eval_results_file: "data/eval_results.json"
+  figures_dir: "data/figures_v2"
+  generations_file: "data/eval_generations_v2.json"
+  eval_results_file: "data/eval_results_v2.json"
+  judge_cache_file: "data/judge_cache.jsonl"
 
 # --- PoliTune Data ---
 politune:
@@ -16,14 +18,15 @@ politune:
 
 # --- Dataset Construction ---
 datasets:
-  train_split: 0.9
-  eval_split: 0.1
-  seed: 42
+  eval_ratio: 0.1            # share of unique prompts held out (global split)
+  seed: 42                   # global split seed
+  flip_seeds: [42, 43, 44]   # label-flip draws for sft_merged (one per training seed)
+  n_eval_split_per_origin: 75  # Tier 5 prompts sampled per origin
 
 # --- Training ---
 training:
-  base_model: "mistralai/Mistral-7B-v0.1"
   sft_base_model: "mistralai/Mistral-7B-Instruct-v0.2"
+  seeds: [42, 43, 44]
 
   # QLoRA config
   lora_rank: 16
@@ -42,14 +45,33 @@ training:
     max_length: 2048
     warmup_ratio: 0.1
 
-  seed: 42
   wandb_project: "preference-collapse-dpo"  # Set to null to disable W&B
 
-# --- Evaluation ---
+# --- Generation ---
+generation:
+  temperature: 0.7
+  top_p: 0.9
+  max_new_tokens: 512
+  samples_per_prompt: 5
+  batch_prompts: 8
+
+# --- Adapter merging (dense deltas added to the bf16 base) ---
+merging:
+  ties_density: 0.5
+  control_pairs: [[42, 43]]  # same-ideology merges (seed_a, seed_b)
+
+# --- Evaluation / judging ---
+# Providers: openai (OPENAI_API_KEY), gemini (GEMINI_API_KEY),
+#            fireworks (FIREWORKS_API_KEY, OpenAI-compatible endpoint)
 evaluation:
-  judge_model: "gpt-5.4"
-  second_judge_model: "gemini-3-flash-preview"
+  judges:
+    - {name: gpt-5.6-luna, provider: openai, model: gpt-5.6-luna}
+    # Extra judges disabled 2026-09-06 for cost; re-enable to run them (cached scores are reused).
+    # - {name: gemini-3.8-flash, provider: gemini, model: gemini-3.8-flash}
+    # - {name: deepseek-v4-flash, provider: fireworks, model: "accounts/fireworks/models/deepseek-v4-flash"}
+    # - {name: glm-5.3-flash, provider: fireworks, model: "accounts/fireworks/models/glm-5p3-flash"}
+  primary_judge: gpt-5.6-luna
+  protocols: [politune, aware]
   judge_temperature: 0.0
-  generation_temperature: 0.7
-  generation_max_tokens: 1024
-  num_eval_samples: null        # null = use all eval data
+  judge_workers: 32
+  bootstrap_reps: 2000

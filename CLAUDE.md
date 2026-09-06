@@ -4,102 +4,72 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Research codebase demonstrating preference collapse when language models are fine-tuned on conflicting political preference distributions. Uses PoliTune political data (left-leaning vs right-leaning) to show that naive aggregation of opposing ideologies produces a model that satisfies neither side — connecting results to Arrow's impossibility theorem from social choice theory.
+Research codebase on preference collapse when a language model is fine-tuned on conflicting political data. Uses the PoliTune datasets (left-leaning Reddit prompts vs right-leaning Truth Social prompts) to test whether aggregating opposing ideologies (by mixing training data, or by merging independently trained LoRA adapters) yields moderation or incoherence.
+
+**Pipeline version:** v2 (September 2026). v1 results (April 2026) are archived under `data/archive/2026-04/` and had Tier 5 train/eval leakage and a wrong adapter-merge computation; do not reuse them.
 
 ## Commands
 
 ```bash
-# All scripts require PYTHONPATH
+source .venv/bin/activate
 export PYTHONPATH=.
 
-# Build datasets from PoliTune (downloads from HuggingFace Hub)
+# Phase A: build datasets (one global prompt split shared by all conditions) and validate
 python scripts/04_build_politune_datasets.py
+python scripts/07_validate_data.py          # must pass before upload
+python scripts/modal_upload_data.py         # -> politune_datasets_v2/ on the data volume
 
-# Upload datasets to Modal
-python scripts/modal_upload_data.py
+# Phase B: training, one run per (condition, seed); saves LoRA adapters only
+modal run modal_train.py --condition all --seeds 42,43,44
 
-# Modal cloud training (SFT)
-modal run modal_train.py --condition sft_right
-modal run modal_train.py --condition sft_left
-modal run modal_train.py --condition sft_merged
+# Phase C: generation, 5 samples per prompt, bf16 base + dense adapter delta
+modal run modal_evaluate.py --instance all              # baseline + 9 SFT instances
+modal run modal_merge_adapters.py                       # 6 cross-ideology merges + 4 controls
+modal run modal_evaluate.py --instance baseline --limit-prompts 10   # dry run
 
-# Test generation
-modal run modal_test_generate.py --condition sft_right
+# Phase D/E: judging (4 judges x 2 protocols, cached) and metrics
+python scripts/06_evaluate.py --score --limit 20        # dry run every judge first
+python scripts/06_evaluate.py --all
+python scripts/08_analysis_tables.py                    # LaTeX tables -> paper/tables/
 
-# Evaluation (generate on Modal, score locally)
-modal run modal_evaluate.py --condition all
-PYTHONPATH=. python scripts/06_evaluate.py --all
-
-# Adapter merging (local, no GPU needed)
-PYTHONPATH=. python scripts/merge_adapters.py
-
-# Download trained models
-python scripts/modal_download_models.py
-
-# Activate venv
-source .venv/bin/activate
+# Tests
+python -m pytest tests -q
 ```
 
 ## Architecture
 
-**SFT training** from `Mistral-7B-Instruct-v0.2` (no SFT Stage 1 needed — already instruction-tuned):
+- `src/politune_data.py` — loads PoliTune, makes the **global prompt-level split** (`global_split.json`), builds `sft_right`, `sft_left`, `sft_merged_s{seed}` (label flips re-drawn per seed).
+- `src/eval_prompts.py` — 193 prompts: Tiers 1–4 are 43 curated neutral questions (`prompt_kind="question"`); Tier 5 is 150 PoliTune stance instructions held out of every train split, 75 per origin (`prompt_kind="instruction"`).
+- `src/generation.py` — instance enumeration, dense adapter deltas (`alpha/r * B @ A`), linear / TIES merging on the deltas via PEFT's `merge_utils`, seeded batched generation. All instances share one inference path: bf16 base + delta.
+- `src/evaluation.py` — judge registry (openai / gemini / fireworks providers), two protocols (`politune` integer-only, `aware` JSON with unscoreable/hedge/coherence), JSONL judge cache, metrics (bootstrap CIs, variance decomposition, Brown-Forsythe, consistency, Pareto, Tier 5 by origin, Krippendorff's alpha).
+- `src/visualization.py` — figures from the results JSON.
+- `modal_train.py`, `modal_evaluate.py`, `modal_merge_adapters.py`, `modal_test_generate.py` — Modal entry points (L40S). The image mounts `src/` via `add_local_python_source`.
+- `tests/test_merge_math.py` — proves the merge is on delta weights and documents why PEFT's `linear`/`ties` combination types are not used (cross terms).
 
-- **SFT conditions:** Supervised fine-tuning on PoliTune `chosen` responses. Per-condition (right/left/merged). Saves both full merged model AND LoRA adapter.
-- **Adapter merging:** Post-hoc merging of trained left/right LoRA adapters using linear averaging and TIES. Tests a different aggregation mechanism (no additional training).
+## Instances and conditions
 
-**Module graph**:
-- `src/politune_data.py` — loads PoliTune left/right datasets from HuggingFace Hub, builds SFT datasets for all conditions
-- `src/sft_training.py` — local SFT training (also available via Modal)
-- `src/evaluation.py` — LLM-as-judge scoring, consistency, Pareto analysis
-- `src/visualization.py` — ideology scores, Pareto, consistency, tier comparison plots
-- `src/eval_prompts.py` — 194 evaluation prompts across 5 tiers
-- `modal_train.py` — Modal cloud SFT training
-- `modal_evaluate.py` — Modal batch generation for evaluation
-- `modal_test_generate.py` — Modal quick generation testing
-
-## Experimental Conditions
-
-### SFT conditions (ideology via supervised fine-tuning)
-
-| Condition | Training data | Purpose |
+| Condition | Instances | How built |
 |---|---|---|
-| `baseline` | None (Mistral-7B-Instruct-v0.2 as-is) | Neutral reference |
-| `sft_right` | Right-leaning chosen responses (2,831) | Right-leaning specialist |
-| `sft_left` | Left-leaning chosen responses (2,360) | Left-leaning specialist |
-| `sft_merged` | 50/50 mix, randomly flipped labels | **SFT-level collapse** |
+| `baseline` | 1 | Mistral-7B-Instruct-v0.2 bf16 |
+| `sft_left`, `sft_right`, `sft_merged` | 3 seeds each | QLoRA adapter (r=16, q/v_proj) applied to the bf16 base |
+| `merged_linear`, `merged_ties` | 3 each | left seed k + right seed k, delta-weight average / TIES (density 0.5) |
+| `ctrl_{linear,ties}_{left,right}` | 1 each | same-ideology merge of seeds 42+43 (control for merge damage) |
 
-### Adapter merging conditions (no training)
+## Data schema
 
-| Condition | Method | Purpose |
-|---|---|---|
-| `merged_linear` | Average left + right LoRA adapters | Weight-space collapse |
-| `merged_ties` | TIES merge of left + right adapters | Conflict-resolved merging |
+Generation records (`data/eval_generations_v2.json`): `prompt_id, condition, instance, seed, sample_idx, tier, topic, origin, prompt_kind, prompt, response, gen_params, scores`. Scores are keyed `"{protocol}/{judge}"`; politune values are `{"score": int}`, aware values are `{"score", "unscoreable", "hedge", "coherence"}`.
 
-## Data
+## Key decisions (do not undo)
 
-PoliTune datasets from HuggingFace Hub:
-- `scale-lab/politune-right` — 2,831 preference pairs (right-chosen)
-- `scale-lab/politune-left` — 2,360 preference pairs (left-chosen)
-
-SFT datasets are extracted from the `chosen` column as instruction-response conversations.
-
-## Key Patterns
-
-**QLoRA config**: rank=16, alpha=32, 2 target modules (q_proj, v_proj), 4-bit NF4 quantization, bfloat16 compute.
-
-**SFT hyperparams**: lr=2e-4, 2 epochs. Saves LoRA adapter AND merges into base model.
-
-**TRL notes**: Use `max_length` (not `max_seq_length`). `warmup_ratio` is deprecated in TRL v5.2+ — training scripts use `warmup_steps`. SFT auto-applies chat template when dataset has `messages` column.
+- Primary tables use Tiers 1–4 only; Tier 5 is reported separately and split by origin (instruction following, not ideology).
+- Pareto dominance is directional (within each side of the centre); a centrist model is dominated by construction, so hedge rate and variance decomposition are the discriminators.
+- Judges: `gpt-5.6-luna` (primary), `gemini-3.8-flash`, DeepSeek V4 Flash and GLM 5.3 Flash via Fireworks. Configured in `configs/config.yaml`; API keys in `.env` (`OPENAI_API_KEY`, `GEMINI_API_KEY`, `FIREWORKS_API_KEY`).
+- Never launch the full judge pass before the 20-record dry run per provider.
 
 ## Modal
 
-Three Modal volumes:
-- `preference-collapse-data` — PoliTune datasets
-- `preference-collapse-models` — SFT models + LoRA adapters
-- `preference-collapse-hf-cache` — cached HuggingFace model downloads
+Volumes: `preference-collapse-data` (datasets, `politune_datasets_v2/`), `preference-collapse-models` (`{condition}_s{seed}_adapter/` + trainer checkpoints), `preference-collapse-hf-cache`. Secrets: `wandb-secret`, `huggingface-secret`. GPU: L40S. Compute is meant to fit inside the Starter plan's monthly free credit.
 
-Secrets required: `wandb-secret` (WANDB_API_KEY), `huggingface-secret` (HF_TOKEN). GPU: L40S.
+## TRL / PEFT notes
 
-**SFT models** are saved in two forms:
-- Full merged model at `/models/{condition}/` (for generation)
-- LoRA adapter at `/models/{condition}_adapter/` (for adapter merging)
+Use `max_length` (not `max_seq_length`); `warmup_steps` is computed from `warmup_ratio`. SFT datasets are conversational (`messages`); extra columns are dropped with `select_columns` before training. PEFT `add_weighted_adapter(combination_type="linear"|"ties")` is **not** a delta-weight merge — see `src/generation.py`.

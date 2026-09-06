@@ -1,20 +1,15 @@
-"""Supervised Fine-Tuning (SFT) — two stages.
+"""Supervised fine-tuning (SFT) of Mistral-7B-Instruct-v0.2 on PoliTune data.
 
-Stage 1 (sft_base): Train base model on UltraChat for general chat ability.
-  - Trained ONCE, shared by all DPO conditions.
-  - Already completed and saved to models/sft_base/ on Modal.
-
-Stage 2 (sft_ideology): Train SFT model on PoliTune ideological data.
-  - Per-condition: right-leaning, left-leaning, or mixed.
-  - Teaches the model to generate in the target ideological style.
-  - Merges LoRA into base and saves full model for optional DPO on top.
-
-Both stages use QLoRA with the Zephyr recipe hyperparameters.
+Local counterpart of modal_train.py. One run per (condition, seed):
+  - QLoRA (rank 16, q_proj/v_proj, NF4) on the chosen responses
+  - saves the LoRA adapter (generation adds its delta to the bf16 base)
+  - writes train_summary.json with per-epoch losses for reporting
 """
 
 from __future__ import annotations
 
 import gc
+import json
 from pathlib import Path
 
 import torch
@@ -24,27 +19,28 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import SFTConfig, SFTTrainer
 
 
+def latest_checkpoint(output_dir: str | Path) -> str | None:
+    """Return the checkpoint dir with the highest step (numeric sort)."""
+    p = Path(output_dir)
+    if not p.exists():
+        return None
+    cps = [c for c in p.glob("checkpoint-*") if c.name.split("-")[-1].isdigit()]
+    if not cps:
+        return None
+    return str(max(cps, key=lambda c: int(c.name.split("-")[-1])))
+
+
 def _run_sft(
     train_data,
     eval_data,
     base_model_path: str,
     output_dir: str,
+    adapter_dir: str,
     run_name: str,
+    seed: int,
     config: dict,
 ) -> str:
-    """Shared SFT training logic for both stages.
-
-    Args:
-        train_data: HF Dataset for training.
-        eval_data: HF Dataset for evaluation.
-        base_model_path: Path or HF model ID to load as base.
-        output_dir: Where to save the merged model.
-        run_name: Name for W&B run.
-        config: Training configuration dict.
-
-    Returns:
-        Path to saved merged model.
-    """
+    """Train one SFT run and save adapter + merged model."""
     train_cfg = config["training"]
     sft_cfg = train_cfg.get("sft", {})
 
@@ -62,12 +58,9 @@ def _run_sft(
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,
     )
-
     model = AutoModelForCausalLM.from_pretrained(
-        base_model_path,
-        quantization_config=bnb_config,
-        device_map="auto",
-        dtype=torch.bfloat16,
+        base_model_path, quantization_config=bnb_config,
+        device_map="auto", dtype=torch.bfloat16,
     )
     model = prepare_model_for_kbit_training(model)
     model.config.use_cache = False
@@ -88,27 +81,32 @@ def _run_sft(
     wandb_enabled = train_cfg.get("wandb_project") is not None
     if wandb_enabled:
         import wandb
-        wandb.init(
-            project=train_cfg["wandb_project"],
-            name=run_name,
-            config={"stage": "sft", "base_model": base_model_path, "run_name": run_name},
-        )
+        wandb.init(project=train_cfg["wandb_project"], name=run_name,
+                   config={"stage": "sft", "base_model": base_model_path,
+                           "run_name": run_name, "seed": seed})
+
+    bs = sft_cfg.get("per_device_batch_size", 4)
+    ga = sft_cfg.get("gradient_accumulation_steps", 2)
+    epochs = sft_cfg.get("num_epochs", 2)
+    total_steps = (len(train_data) // (bs * ga)) * epochs
+    warmup_steps = int(total_steps * sft_cfg.get("warmup_ratio", 0.1))
 
     training_args = SFTConfig(
         output_dir=output_dir,
-        num_train_epochs=sft_cfg.get("num_epochs", 1),
-        per_device_train_batch_size=sft_cfg.get("per_device_batch_size", 4),
-        per_device_eval_batch_size=sft_cfg.get("per_device_batch_size", 4),
-        gradient_accumulation_steps=sft_cfg.get("gradient_accumulation_steps", 2),
+        num_train_epochs=epochs,
+        per_device_train_batch_size=bs,
+        per_device_eval_batch_size=bs,
+        gradient_accumulation_steps=ga,
         learning_rate=sft_cfg.get("learning_rate", 2e-4),
-        warmup_steps=int(((len(train_data) // (sft_cfg.get("per_device_batch_size", 4) * sft_cfg.get("gradient_accumulation_steps", 2))) * sft_cfg.get("num_epochs", 1)) * sft_cfg.get("warmup_ratio", 0.1)),
+        warmup_steps=warmup_steps,
         max_length=sft_cfg.get("max_length", 2048),
         bf16=True,
         gradient_checkpointing=True,
         logging_steps=10,
         save_strategy="epoch",
         eval_strategy="epoch",
-        seed=train_cfg["seed"],
+        seed=seed,
+        data_seed=seed,
         report_to="wandb" if wandb_enabled else "none",
         run_name=run_name if wandb_enabled else None,
     )
@@ -122,86 +120,74 @@ def _run_sft(
         peft_config=lora_config,
     )
 
-    output_path = Path(output_dir)
-    checkpoints = sorted(output_path.glob("checkpoint-*")) if output_path.exists() else []
-    if checkpoints:
-        print(f"Resuming from checkpoint: {checkpoints[-1]}")
-        trainer.train(resume_from_checkpoint=str(checkpoints[-1]))
+    ckpt = latest_checkpoint(output_dir)
+    if ckpt:
+        print(f"Resuming from checkpoint: {ckpt}")
+        trainer.train(resume_from_checkpoint=ckpt)
     else:
         trainer.train()
 
-    print("Merging LoRA adapter into base model...")
-    merged_model = trainer.model.merge_and_unload()
-    merged_model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
+    history = trainer.state.log_history
+    summary = {
+        "run_name": run_name,
+        "seed": seed,
+        "n_train": len(train_data),
+        "n_eval": len(eval_data),
+        "total_steps": trainer.state.global_step,
+        "warmup_steps": warmup_steps,
+        "train_loss": [h for h in history if "loss" in h and "eval_loss" not in h],
+        "eval_loss": [h for h in history if "eval_loss" in h],
+        "hyperparams": sft_cfg,
+    }
+
+    # Save the adapter only; generation applies its dense delta to the bf16
+    # base (src/generation.py), so no merged checkpoint is written.
+    trainer.save_model(adapter_dir)
+    tokenizer.save_pretrained(adapter_dir)
+    Path(adapter_dir, "train_summary.json").write_text(json.dumps(summary, indent=2, default=str))
+    print(f"Saved LoRA adapter + train_summary.json to {adapter_dir}")
 
     if wandb_enabled:
         import wandb
         wandb.finish()
 
-    del trainer, model, merged_model
+    del trainer, model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-    print(f"Saved merged SFT model to {output_dir}")
-    return output_dir
+    return adapter_dir
 
 
-def train_sft_base(config: dict) -> str:
-    """Stage 1: Train base model on UltraChat for general chat ability."""
-    from datasets import load_dataset
-
-    train_cfg = config["training"]
-    sft_cfg = train_cfg.get("sft", {})
-    output_dir = str(Path(config["paths"]["models_dir"]) / "sft_base")
-
-    if Path(f"{output_dir}/config.json").exists():
-        print(f"SFT base model already exists at {output_dir}, skipping")
-        return output_dir
-
-    subset_size = sft_cfg.get("subset_size", 20000)
-    print(f"Loading UltraChat 200K (subsample {subset_size})...")
-    dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft")
-    dataset = dataset.shuffle(seed=train_cfg["seed"]).select(range(subset_size))
-    dataset = dataset.remove_columns([c for c in dataset.column_names if c != "messages"])
-
-    split = dataset.train_test_split(test_size=0.05, seed=train_cfg["seed"])
-
-    return _run_sft(
-        split["train"], split["test"],
-        base_model_path=train_cfg["base_model"],
-        output_dir=output_dir,
-        run_name="sft_base",
-        config=config,
-    )
-
-
-def train_sft_ideology(sft_dataset: DatasetDict, config: dict, condition_name: str) -> str:
-    """Stage 2: Train SFT model on ideological data (PoliTune).
-
-    Loads the Stage 1 SFT model and continues training on politically
-    biased data to shift the model's ideological position.
+def train_sft_ideology(sft_dataset: DatasetDict, config: dict,
+                       condition_name: str, seed: int) -> str:
+    """Train one ideology SFT run (condition, seed) from the instruct base model.
 
     Args:
         sft_dataset: DatasetDict with train/eval splits (messages format).
-        config: Configuration dict.
-        condition_name: e.g. "sft_right", "sft_left", "sft_merged".
+        config: Configuration dict (configs/config.yaml).
+        condition_name: "sft_right" | "sft_left" | "sft_merged".
+        seed: Training seed; also selects the label-flip draw for sft_merged.
 
     Returns:
-        Path to saved merged model.
+        Path to the saved adapter directory.
     """
-    sft_base_model = config["training"].get("sft_base_model", "mistralai/Mistral-7B-Instruct-v0.2")
-    output_dir = str(Path(config["paths"]["models_dir"]) / condition_name)
+    base = config["training"].get("sft_base_model", "mistralai/Mistral-7B-Instruct-v0.2")
+    run_name = f"{condition_name}_s{seed}"
+    models_dir = Path(config["paths"]["models_dir"])
+    output_dir = str(models_dir / run_name)
+    adapter_dir = str(models_dir / f"{run_name}_adapter")
 
-    if Path(f"{output_dir}/config.json").exists():
-        print(f"{condition_name} model already exists at {output_dir}, skipping")
-        return output_dir
+    if Path(adapter_dir, "adapter_config.json").exists():
+        print(f"{run_name} adapter already exists at {adapter_dir}, skipping")
+        return adapter_dir
 
     return _run_sft(
-        sft_dataset["train"], sft_dataset["eval"],
-        base_model_path=sft_base_model,
+        sft_dataset["train"].select_columns(["messages"]),
+        sft_dataset["eval"].select_columns(["messages"]),
+        base_model_path=base,
         output_dir=output_dir,
-        run_name=condition_name,
+        adapter_dir=adapter_dir,
+        run_name=run_name,
+        seed=seed,
         config=config,
     )

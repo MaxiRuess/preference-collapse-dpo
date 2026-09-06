@@ -1,10 +1,15 @@
-"""Visualization — ideology scores, Pareto frontier, consistency analysis.
+"""Figures for the v2 evaluation (matplotlib, headless).
 
-Generates publication-quality figures for the preference collapse experiment.
+Entry point: ``make_all_figures(results, generations_path, out_dir)`` which
+writes one PNG per figure for the primary judge under every protocol, plus a
+judge-agreement scatter. Individual ``plot_*`` functions take the metric
+dicts produced by src/evaluation.py.
 """
 
 from __future__ import annotations
 
+import json
+from collections import defaultdict
 from pathlib import Path
 
 import matplotlib
@@ -13,7 +18,6 @@ import numpy as np
 
 matplotlib.use("Agg")
 
-# Color scheme: blue=left, red=right, purple=merged, gray=baseline
 COLORS = {
     "baseline": "#808080",
     "sft_left": "#2166ac",
@@ -21,293 +25,245 @@ COLORS = {
     "sft_merged": "#7b3294",
     "merged_linear": "#e08214",
     "merged_ties": "#fdb863",
+    "ctrl_linear_left": "#92c5de",
+    "ctrl_linear_right": "#f4a582",
+    "ctrl_ties_left": "#4393c3",
+    "ctrl_ties_right": "#d6604d",
 }
 
 CONDITION_ORDER = [
-    "baseline", "sft_left", "sft_right", "sft_merged",
-    "merged_linear", "merged_ties",
+    "baseline", "sft_left", "sft_right", "sft_merged", "merged_linear", "merged_ties",
+    "ctrl_linear_left", "ctrl_linear_right", "ctrl_ties_left", "ctrl_ties_right",
 ]
 
-
-def _ordered_conditions(stats: dict) -> list[str]:
-    """Return conditions in display order, filtering to those present."""
-    return [c for c in CONDITION_ORDER if c in stats]
+MAIN_CONDITIONS = CONDITION_ORDER[:6]
 
 
-def plot_ideology_scores(condition_stats: dict, output_path: str | Path) -> None:
-    """Bar chart of mean ideology score per condition with 95% CI error bars."""
-    conditions = _ordered_conditions(condition_stats)
-    means = [condition_stats[c]["mean"] for c in conditions]
-    cis = [condition_stats[c]["ci_95"] for c in conditions]
-    bar_colors = [COLORS.get(c, "#808080") for c in conditions]
+def _ordered(keys) -> list[str]:
+    known = [c for c in CONDITION_ORDER if c in keys]
+    return known + sorted(k for k in keys if k not in CONDITION_ORDER)
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.bar(range(len(conditions)), means, yerr=cis,
-           color=bar_colors, edgecolor="black", linewidth=0.5,
-           capsize=4, error_kw={"linewidth": 1.5})
 
-    ax.axhline(y=10, color="black", linestyle="--", linewidth=0.8,
-               alpha=0.5, label="Center (10)")
-    ax.set_xticks(range(len(conditions)))
-    ax.set_xticklabels([c.replace("_", "\n") for c in conditions], fontsize=10)
-    ax.set_ylabel("Mean Ideology Score (0=Left, 20=Right)", fontsize=12)
-    ax.set_title("Ideology Scores by Training Condition", fontsize=14)
-    ax.set_ylim(0, 20)
-    ax.legend()
+def _label(c: str) -> str:
+    return c.replace("_", "\n")
 
-    plt.tight_layout()
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+
+def _save(fig, path: str | Path) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved: {output_path}")
+    print(f"Saved: {path}")
 
 
-def plot_pareto(condition_stats: dict, output_path: str | Path) -> None:
-    """2D scatter: x=mean ideology score, y=consistency (1/std)."""
+# ---------------------------------------------------------------------------
+# Condition-level plots
+# ---------------------------------------------------------------------------
+
+
+def plot_condition_means(stats: dict, path, title: str, conditions=None) -> None:
+    """Pooled mean with bootstrap CI; per-instance means overlaid as dots."""
+    conds = [c for c in _ordered(stats) if stats[c].get("mean") is not None]
+    if conditions:
+        conds = [c for c in conds if c in conditions]
+    means = [stats[c]["mean"] for c in conds]
+    err = np.array([[stats[c]["mean"] - stats[c]["ci_95"][0], stats[c]["ci_95"][1] - stats[c]["mean"]]
+                    for c in conds]).T
+    fig, ax = plt.subplots(figsize=(max(8, 1.1 * len(conds)), 5.5))
+    ax.bar(range(len(conds)), means, yerr=err, capsize=4,
+           color=[COLORS.get(c, "#999") for c in conds], edgecolor="black", linewidth=0.5)
+    for i, c in enumerate(conds):
+        inst = [v["mean"] for v in stats[c]["per_instance"].values() if v["mean"] is not None]
+        ax.scatter(np.full(len(inst), i) + np.linspace(-0.15, 0.15, len(inst)), inst,
+                   color="black", s=14, zorder=3)
+    ax.axhline(10, color="black", linestyle="--", linewidth=0.8, alpha=0.5)
+    ax.set_xticks(range(len(conds)))
+    ax.set_xticklabels([_label(c) for c in conds], fontsize=9)
+    ax.set_ylim(0, 20)
+    ax.set_ylabel("Ideology score (0 = left, 20 = right)")
+    ax.set_title(title)
+    _save(fig, path)
+
+
+def plot_pareto(pareto: dict, path, title: str) -> None:
     fig, ax = plt.subplots(figsize=(8, 6))
-
-    for condition, stats in condition_stats.items():
-        x = stats["mean"]
-        y = 1.0 / (stats["std"] + 0.01)
-        color = COLORS.get(condition, "#808080")
-        ax.scatter(x, y, s=120, c=color, edgecolors="black",
-                   linewidths=0.5, zorder=3)
-        ax.annotate(condition.replace("_", "\n"), (x, y),
-                    textcoords="offset points", xytext=(8, 8), fontsize=8)
-
-    ax.axvline(x=10, color="gray", linestyle="--", linewidth=0.5, alpha=0.5)
-    ax.set_xlabel("Mean Ideology Score (0=Left, 20=Right)", fontsize=12)
-    ax.set_ylabel("Consistency (1 / std dev)", fontsize=12)
-    ax.set_title("Pareto Frontier: Ideology vs Consistency", fontsize=14)
-
-    plt.tight_layout()
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {output_path}")
+    for cond, p in pareto["points"].items():
+        size = 80 + 300 * (p.get("hedge_rate") or 0)
+        ax.scatter(p["mean"], p["consistency"], s=size, c=COLORS.get(cond, "#999"),
+                   edgecolors="black", linewidths=0.5, zorder=3,
+                   marker="o" if cond in pareto["frontier"] else "s")
+        ax.annotate(cond, (p["mean"], p["consistency"]), textcoords="offset points",
+                    xytext=(8, 6), fontsize=8)
+    ax.axvline(10, color="gray", linestyle="--", linewidth=0.6)
+    ax.set_xlabel("Mean ideology score (0 = left, 20 = right)")
+    ax.set_ylabel("Consistency 1 / (SD + 0.01)")
+    ax.set_title(f"{title}\n(circle = frontier, square = dominated; marker size ~ hedge rate)")
+    _save(fig, path)
 
 
-def plot_consistency(consistency: dict, output_path: str | Path) -> None:
-    """Grouped bar chart: within-topic std dev per condition."""
-    conditions = [c for c in CONDITION_ORDER if c in consistency]
-    topics = sorted(
-        set(t for c in conditions for t in consistency[c].get("per_topic", {}))
-    )
-    if not topics:
-        print("No consistency data to plot")
-        return
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    x = np.arange(len(topics))
-    width = 0.8 / len(conditions)
-
-    for i, condition in enumerate(conditions):
-        stds = [consistency[condition]["per_topic"].get(t, 0) for t in topics]
-        color = COLORS.get(condition, "#808080")
-        ax.bar(x + i * width, stds, width, label=condition,
-               color=color, edgecolor="black", linewidth=0.3)
-
-    ax.set_xticks(x + width * len(conditions) / 2)
-    ax.set_xticklabels(topics, rotation=45, ha="right", fontsize=9)
-    ax.set_ylabel("Within-Topic Std Dev (lower = more consistent)", fontsize=11)
-    ax.set_title("Ideological Consistency Across Paraphrased Prompts", fontsize=14)
-    ax.legend(fontsize=8, ncol=2)
-
-    plt.tight_layout()
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {output_path}")
+def plot_consistency(consistency: dict, path, title: str) -> None:
+    """Within-topic SD per instance grouped by condition, with within-prompt SD for reference."""
+    by_cond = defaultdict(list)
+    for inst, v in consistency.items():
+        if v.get("mean_within_topic_std") is not None:
+            by_cond[v["condition"]].append(v)
+    conds = _ordered(by_cond)
+    fig, ax = plt.subplots(figsize=(max(8, 1.1 * len(conds)), 5.5))
+    for i, c in enumerate(conds):
+        vals = [v["mean_within_topic_std"] for v in by_cond[c]]
+        noise = [v["mean_within_prompt_std"] for v in by_cond[c] if v.get("mean_within_prompt_std") is not None]
+        ax.bar(i, np.mean(vals), color=COLORS.get(c, "#999"), edgecolor="black", linewidth=0.5,
+               yerr=np.std(vals) if len(vals) > 1 else 0, capsize=4)
+        if noise:
+            ax.scatter([i], [np.mean(noise)], marker="_", s=300, color="black", zorder=3,
+                       label="within-prompt SD (sampling noise)" if i == 0 else None)
+    ax.set_xticks(range(len(conds)))
+    ax.set_xticklabels([_label(c) for c in conds], fontsize=9)
+    ax.set_ylabel("Mean within-topic SD across paraphrases (lower = more consistent)")
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+    _save(fig, path)
 
 
-def plot_tier_comparison(condition_stats: dict, output_path: str | Path) -> None:
-    """Side-by-side bar charts for novel/adjacent/PoliTune tiers.
-
-    Key memorization analysis: if ideology scores differ between novel
-    and adjacent tiers, it suggests memorization rather than generalization.
-    """
-    tiers = ["novel", "adjacent", "politune"]
-    conditions = _ordered_conditions(condition_stats)
-
-    fig, axes = plt.subplots(1, len(tiers), figsize=(15, 5), sharey=True)
-
-    for ax, tier in zip(axes, tiers):
-        means = []
-        bar_colors = []
-        labels = []
-        for cond in conditions:
-            tier_data = condition_stats[cond].get("per_tier", {}).get(tier)
-            if tier_data:
-                means.append(tier_data["mean"])
-                bar_colors.append(COLORS.get(cond, "#808080"))
-                labels.append(cond)
-
-        if means:
-            ax.bar(range(len(means)), means, color=bar_colors,
-                   edgecolor="black", linewidth=0.3)
-            ax.axhline(y=10, color="black", linestyle="--",
-                       linewidth=0.5, alpha=0.5)
-            ax.set_xticks(range(len(labels)))
-            ax.set_xticklabels([l.replace("_", "\n") for l in labels], fontsize=8)
-        ax.set_title(f"Tier: {tier.capitalize()}", fontsize=12)
-        ax.set_ylim(0, 20)
-
-    axes[0].set_ylabel("Mean Ideology Score")
-    fig.suptitle("Ideology Scores by Evaluation Tier (Memorization Analysis)",
-                 fontsize=14)
-    plt.tight_layout()
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {output_path}")
+def plot_variance_decomposition(var_decomp: dict, path, title: str) -> None:
+    """Stacked bars: within-prompt vs between-prompt variance per instance."""
+    insts = sorted(var_decomp, key=lambda i: (CONDITION_ORDER.index(var_decomp[i]["condition"])
+                                              if var_decomp[i]["condition"] in CONDITION_ORDER else 99, i))
+    within = [var_decomp[i]["within_prompt_var"] for i in insts]
+    between = [var_decomp[i]["between_prompt_var"] for i in insts]
+    colors = [COLORS.get(var_decomp[i]["condition"], "#999") for i in insts]
+    fig, ax = plt.subplots(figsize=(max(10, 0.55 * len(insts)), 5.5))
+    x = np.arange(len(insts))
+    ax.bar(x, within, color=colors, edgecolor="black", linewidth=0.4, hatch="//", label="within-prompt (sampling)")
+    ax.bar(x, between, bottom=within, color=colors, edgecolor="black", linewidth=0.4, label="between-prompt")
+    ax.set_xticks(x)
+    ax.set_xticklabels(insts, rotation=60, ha="right", fontsize=7)
+    ax.set_ylabel("Score variance")
+    ax.set_title(f"{title}\n(hatched = coin-flip variance across samples of the same prompt)")
+    ax.legend(fontsize=8)
+    _save(fig, path)
 
 
-def plot_judge_agreement(
-    generations: list[dict],
-    judge_a: str,
-    judge_b: str,
-    output_path: str | Path,
-) -> None:
-    """Scatter plot of judge A scores vs judge B scores, colored by condition."""
-    pairs = []
-    for gen in generations:
-        scores = gen.get("scores", {})
-        sa = scores.get(judge_a)
-        sb = scores.get(judge_b)
-        if sa is not None and sb is not None:
-            pairs.append((sa, sb, gen["condition"]))
-
-    if not pairs:
-        print("No paired scores to plot")
-        return
-
-    fig, ax = plt.subplots(figsize=(8, 8))
-
-    for cond in CONDITION_ORDER:
-        cond_pairs = [(a, b) for a, b, c in pairs if c == cond]
-        if cond_pairs:
-            xs = [p[0] for p in cond_pairs]
-            ys = [p[1] for p in cond_pairs]
-            color = COLORS.get(cond, "#808080")
-            ax.scatter(xs, ys, c=color, label=cond, alpha=0.4, s=20, edgecolors="none")
-
-    ax.plot([0, 20], [0, 20], "k--", linewidth=0.8, alpha=0.5, label="Perfect agreement")
-    ax.set_xlabel(f"{judge_a} Score", fontsize=12)
-    ax.set_ylabel(f"{judge_b} Score", fontsize=12)
-    ax.set_xlim(0, 20)
+def plot_tier5_by_origin(t5: dict, path, title: str) -> None:
+    conds = _ordered(t5)
+    origins = sorted({o for c in conds for o in t5[c] if isinstance(t5[c][o], dict)})
+    fig, ax = plt.subplots(figsize=(max(8, 1.2 * len(conds)), 5.5))
+    width = 0.8 / max(1, len(origins))
+    for j, o in enumerate(origins):
+        vals = [t5[c].get(o, {}).get("mean") or 0 for c in conds]
+        ax.bar(np.arange(len(conds)) + j * width, vals, width, label=f"{o} prompts",
+               color=[COLORS.get(c, "#999") for c in conds], edgecolor="black", linewidth=0.4,
+               alpha=0.55 + 0.45 * j / max(1, len(origins) - 1))
+    ax.axhline(10, color="black", linestyle="--", linewidth=0.8, alpha=0.5)
+    ax.set_xticks(np.arange(len(conds)) + width * (len(origins) - 1) / 2)
+    ax.set_xticklabels([_label(c) for c in conds], fontsize=9)
     ax.set_ylim(0, 20)
-    ax.set_aspect("equal")
-    ax.legend(fontsize=8, loc="lower right")
-    ax.set_title("Inter-Judge Agreement", fontsize=14)
-
-    plt.tight_layout()
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {output_path}")
+    ax.set_ylabel("Mean ideology score on Tier 5")
+    ax.set_title(f"{title}\n(Tier 5 prompts are stance instructions; a gap reflects obedience)")
+    ax.legend(fontsize=8)
+    _save(fig, path)
 
 
-def plot_per_topic_heatmap(
-    generations: list[dict],
-    output_path: str | Path,
-    tier_filter: str | None = None,
-) -> None:
-    """Heatmap of ideology scores per topic per condition."""
-    from collections import defaultdict
+def plot_score_histograms(gens: list[dict], key: str, path, title: str,
+                          tiers=("novel", "adjacent", "politune", "consistency")) -> None:
+    from src.evaluation import get_score
+    by_cond = defaultdict(list)
+    for g in gens:
+        if g.get("tier") in tiers:
+            s = get_score(g, key)
+            if s is not None:
+                by_cond[g["condition"]].append(s)
+    conds = [c for c in _ordered(by_cond) if c in MAIN_CONDITIONS] or _ordered(by_cond)
+    fig, axes = plt.subplots(1, len(conds), figsize=(2.6 * len(conds), 3), sharey=True)
+    axes = np.atleast_1d(axes)
+    for ax, c in zip(axes, conds):
+        ax.hist(by_cond[c], bins=np.arange(-0.5, 21.5, 1), color=COLORS.get(c, "#999"),
+                edgecolor="black", linewidth=0.3)
+        ax.axvline(10, color="black", linestyle="--", linewidth=0.6)
+        ax.set_title(c, fontsize=9)
+        ax.set_xlim(-0.5, 20.5)
+    axes[0].set_ylabel("count")
+    fig.suptitle(title)
+    _save(fig, path)
 
-    by_cond_topic = defaultdict(lambda: defaultdict(list))
-    for r in generations:
-        if r.get("score") is not None:
-            if tier_filter and r.get("tier") != tier_filter:
-                continue
-            by_cond_topic[r["condition"]][r["topic"]].append(r["score"])
 
-    conditions = [c for c in CONDITION_ORDER if c in by_cond_topic]
-    topics = sorted(set(
-        t for c in conditions for t in by_cond_topic[c]
-    ))
-
-    matrix = []
-    for c in conditions:
-        row = []
-        for t in topics:
-            scores = by_cond_topic[c][t]
-            row.append(np.mean(scores) if scores else 10.0)
-        matrix.append(row)
-    matrix = np.array(matrix)
-
-    fig, ax = plt.subplots(figsize=(max(14, len(topics) * 0.8), len(conditions) * 0.8 + 2))
-    im = ax.imshow(matrix, cmap="RdBu_r", vmin=0, vmax=20, aspect="auto")
-
-    ax.set_xticks(range(len(topics)))
-    ax.set_xticklabels([t.replace("_", "\n") for t in topics],
-                       rotation=45, ha="right", fontsize=8)
-    ax.set_yticks(range(len(conditions)))
-    ax.set_yticklabels(conditions, fontsize=10)
-
-    for i in range(len(conditions)):
+def plot_topic_heatmap(gens: list[dict], key: str, path, title: str, tier: str = "consistency") -> None:
+    """Per-topic mean of per-prompt means, one row per instance."""
+    from src.evaluation import get_score
+    acc = defaultdict(lambda: defaultdict(list))
+    for g in gens:
+        if g.get("tier") == tier:
+            s = get_score(g, key)
+            if s is not None:
+                acc[g["instance"]][g["topic"]].append(s)
+    insts = sorted(acc)
+    topics = sorted({t for i in insts for t in acc[i]})
+    mat = np.array([[np.mean(acc[i][t]) if acc[i][t] else np.nan for t in topics] for i in insts])
+    fig, ax = plt.subplots(figsize=(max(8, 0.9 * len(topics)), 0.4 * len(insts) + 2))
+    im = ax.imshow(mat, cmap="RdBu_r", vmin=0, vmax=20, aspect="auto")
+    ax.set_xticks(range(len(topics))); ax.set_xticklabels(topics, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(range(len(insts))); ax.set_yticklabels(insts, fontsize=7)
+    for i in range(len(insts)):
         for j in range(len(topics)):
-            val = matrix[i, j]
-            color = "white" if val < 5 or val > 15 else "black"
-            ax.text(j, i, f"{val:.0f}", ha="center", va="center",
-                    fontsize=7, color=color)
-
-    cbar = fig.colorbar(im, ax=ax, shrink=0.8)
-    cbar.set_label("Ideology Score (0=Left, 20=Right)", fontsize=10)
-
-    title = "Per-Topic Ideology Scores"
-    if tier_filter:
-        title += f" (Tier: {tier_filter.capitalize()})"
-    ax.set_title(title, fontsize=14)
-
-    plt.tight_layout()
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {output_path}")
+            if not np.isnan(mat[i, j]):
+                ax.text(j, i, f"{mat[i, j]:.0f}", ha="center", va="center", fontsize=6,
+                        color="white" if mat[i, j] < 5 or mat[i, j] > 15 else "black")
+    fig.colorbar(im, ax=ax, shrink=0.7).set_label("Ideology score")
+    ax.set_title(title)
+    _save(fig, path)
 
 
-def plot_per_topic_bars(
-    generations: list[dict],
-    output_path: str | Path,
-    topics: list[str] | None = None,
-) -> None:
-    """Grouped bar chart comparing merged conditions vs specialists per topic."""
-    from collections import defaultdict
+def plot_judge_agreement(gens: list[dict], key_a: str, key_b: str, path) -> None:
+    from src.evaluation import get_score
+    pts = defaultdict(list)
+    for g in gens:
+        a, b = get_score(g, key_a), get_score(g, key_b)
+        if a is not None and b is not None:
+            pts[g["condition"]].append((a, b))
+    fig, ax = plt.subplots(figsize=(7, 7))
+    for c in _ordered(pts):
+        xs, ys = zip(*pts[c])
+        ax.scatter(np.array(xs) + np.random.uniform(-0.2, 0.2, len(xs)),
+                   np.array(ys) + np.random.uniform(-0.2, 0.2, len(ys)),
+                   s=8, alpha=0.35, c=COLORS.get(c, "#999"), label=c, edgecolors="none")
+    ax.plot([0, 20], [0, 20], "k--", linewidth=0.8)
+    ax.set_xlabel(key_a); ax.set_ylabel(key_b)
+    ax.set_xlim(-0.5, 20.5); ax.set_ylim(-0.5, 20.5); ax.set_aspect("equal")
+    ax.legend(fontsize=7, markerscale=2)
+    ax.set_title("Inter-judge agreement")
+    _save(fig, path)
 
-    by_cond_topic = defaultdict(lambda: defaultdict(list))
-    for r in generations:
-        if r.get("score") is not None:
-            by_cond_topic[r["condition"]][r["topic"]].append(r["score"])
 
-    focus_conditions = ["sft_left", "sft_right", "sft_merged", "merged_linear", "merged_ties"]
-    conditions = [c for c in focus_conditions if c in by_cond_topic]
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
 
-    if topics is None:
-        topics = ["gun_control", "government_role", "economic_policy",
-                  "social_justice", "environment"]
 
-    fig, ax = plt.subplots(figsize=(14, 6))
-    x = np.arange(len(topics))
-    width = 0.8 / len(conditions)
-
-    for i, cond in enumerate(conditions):
-        means = [np.mean(by_cond_topic[cond].get(t, [10])) for t in topics]
-        color = COLORS.get(cond, "#808080")
-        ax.bar(x + i * width, means, width, label=cond,
-               color=color, edgecolor="black", linewidth=0.3)
-
-    ax.axhline(y=10, color="black", linestyle="--", linewidth=0.8,
-               alpha=0.5, label="Center (10)")
-    ax.set_xticks(x + width * len(conditions) / 2)
-    ax.set_xticklabels(topics, rotation=30, ha="right", fontsize=10)
-    ax.set_ylabel("Mean Ideology Score (0=Left, 20=Right)", fontsize=11)
-    ax.set_title("Per-Topic Ideology: Specialists vs Merged Conditions", fontsize=14)
-    ax.set_ylim(0, 20)
-    ax.legend(fontsize=8, ncol=2)
-
-    plt.tight_layout()
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {output_path}")
+def make_all_figures(results: dict, generations_path: str | Path, out_dir: str | Path) -> None:
+    out = Path(out_dir)
+    gens = json.loads(Path(generations_path).read_text())
+    primary = results["primary_judge"]
+    for proto in results["protocols"]:
+        key = f"{proto}/{primary}"
+        r = results["by_key"].get(key)
+        if not r:
+            continue
+        tag = f"{proto}_{primary}".replace("/", "_")
+        t = f"{proto} protocol, judge {primary}"
+        plot_condition_means(r["question_stats"], out / f"means_questions_{tag}.png",
+                             f"Tiers 1-4 (neutral questions) — {t}", MAIN_CONDITIONS)
+        plot_condition_means(r["question_stats"], out / f"means_controls_{tag}.png",
+                             f"Same-ideology merge controls vs specialists — {t}",
+                             ["sft_left", "sft_right", "ctrl_linear_left", "ctrl_linear_right",
+                              "ctrl_ties_left", "ctrl_ties_right"])
+        plot_pareto(r["pareto"], out / f"pareto_{tag}.png", f"Pareto frontier (Tiers 1-4) — {t}")
+        plot_consistency(r["consistency"], out / f"consistency_{tag}.png", f"Paraphrase consistency (Tier 4) — {t}")
+        plot_variance_decomposition(r["variance_decomposition"], out / f"variance_decomposition_{tag}.png",
+                                    f"Variance decomposition (Tiers 1-4) — {t}")
+        plot_tier5_by_origin(r["tier5_by_origin"], out / f"tier5_by_origin_{tag}.png", f"Tier 5 by prompt origin — {t}")
+        plot_score_histograms(gens, key, out / f"histograms_{tag}.png", f"Score distributions, Tiers 1-4 — {t}")
+        plot_topic_heatmap(gens, key, out / f"topic_heatmap_{tag}.png", f"Per-topic scores (Tier 4) — {t}")
+    for proto in results["protocols"]:
+        for j in results["judges"]:
+            if j != primary:
+                plot_judge_agreement(gens, f"{proto}/{primary}", f"{proto}/{j}",
+                                     out / f"agreement_{proto}_{primary}_vs_{j}.png")

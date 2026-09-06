@@ -1,194 +1,75 @@
 #!/usr/bin/env python3
-"""Merge SFT-Left and SFT-Right LoRA adapters to test weight-space preference collapse.
+"""Local adapter merging (thin wrapper over src/generation.py).
 
-Tests two merging strategies:
-  - Linear: arithmetic mean of adapter weights
-  - TIES: trim-integrate-elect-sign merging (resolves sign conflicts)
-
-Requires adapter directories at models/sft_left_adapter/ and models/sft_right_adapter/.
-Download from Modal with: python scripts/modal_download_models.py
+Requires the seed adapters under models/ (download with
+scripts/modal_download_models.py) and a GPU with ~16 GB for the bf16 base.
 
 Usage:
-    python scripts/merge_adapters.py
-    python scripts/merge_adapters.py --generate  # also generate eval responses
+    python scripts/merge_adapters.py --instance merged_linear_s42 --smoke
+    python scripts/merge_adapters.py --instance merge,control --generate
 """
 
 import argparse
-import json
 from pathlib import Path
 
-import torch
-from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import yaml
 
-
-SFT_BASE_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
-LEFT_ADAPTER = "models/sft_left_adapter"
-RIGHT_ADAPTER = "models/sft_right_adapter"
-
-
-def load_base_model():
-    """Load the base model with QLoRA quantization."""
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        SFT_BASE_MODEL, quantization_config=bnb_config,
-        device_map="auto", dtype=torch.bfloat16,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(SFT_BASE_MODEL)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return model, tokenizer
-
-
-def merge_linear(model, tokenizer):
-    """Merge left + right adapters via linear averaging."""
-    print("Loading left adapter...")
-    model = PeftModel.from_pretrained(model, LEFT_ADAPTER, adapter_name="left")
-    print("Loading right adapter...")
-    model.load_adapter(RIGHT_ADAPTER, adapter_name="right")
-
-    print("Merging (linear average)...")
-    model.add_weighted_adapter(
-        adapters=["left", "right"],
-        weights=[0.5, 0.5],
-        adapter_name="merged_linear",
-        combination_type="linear",
-    )
-    model.set_adapter("merged_linear")
-    return model
-
-
-def merge_ties(model, tokenizer):
-    """Merge left + right adapters via TIES merging."""
-    print("Loading left adapter...")
-    model = PeftModel.from_pretrained(model, LEFT_ADAPTER, adapter_name="left")
-    print("Loading right adapter...")
-    model.load_adapter(RIGHT_ADAPTER, adapter_name="right")
-
-    print("Merging (TIES, density=0.5)...")
-    model.add_weighted_adapter(
-        adapters=["left", "right"],
-        weights=[0.5, 0.5],
-        adapter_name="merged_ties",
-        combination_type="ties",
-        density=0.5,
-    )
-    model.set_adapter("merged_ties")
-    return model
-
-
-def generate_responses(model, tokenizer, prompts, condition_name, max_new_tokens=512):
-    """Generate responses for evaluation prompts."""
-    results = []
-    for i, prompt_dict in enumerate(prompts):
-        messages = [{"role": "user", "content": prompt_dict["prompt"]}]
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-        inputs = tokenizer(text, return_tensors="pt").to(model.device)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs, max_new_tokens=max_new_tokens,
-                temperature=0.7, do_sample=True,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        response = tokenizer.decode(
-            outputs[0][inputs["input_ids"].shape[1]:],
-            skip_special_tokens=True,
-        )
-
-        results.append({
-            "prompt_id": prompt_dict["id"],
-            "condition": condition_name,
-            "tier": prompt_dict.get("tier", "unknown"),
-            "topic": prompt_dict.get("topic", "unknown"),
-            "prompt": prompt_dict["prompt"],
-            "response": response,
-        })
-
-        if (i + 1) % 10 == 0:
-            print(f"  [{i + 1}/{len(prompts)}] completed")
-
-    return results
+from src.generation import (
+    GEN_DEFAULTS, build_instances, generate_samples, load_instance_model,
+    load_records, missing_prompts, save_records, select_instances,
+)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Merge SFT adapters")
+    parser = argparse.ArgumentParser(description="Merge SFT adapters locally")
+    parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--models-root", default="models")
+    parser.add_argument("--instance", default="merge,control")
     parser.add_argument("--generate", action="store_true",
-                        help="Generate eval responses from merged models")
-    parser.add_argument("--output", default="data/eval_generations.json",
-                        help="Output file for generated responses")
+                        help="Generate eval responses into the v2 generations file")
+    parser.add_argument("--smoke", action="store_true",
+                        help="Merge and print one short response per instance")
+    parser.add_argument("--output", default="data/eval_generations_v2.json")
     args = parser.parse_args()
 
-    # Verify adapters exist
-    for path in [LEFT_ADAPTER, RIGHT_ADAPTER]:
-        if not Path(path).exists():
-            print(f"Error: Adapter not found at {path}")
-            print("Download from Modal: python scripts/modal_download_models.py")
-            return
+    cfg = yaml.safe_load(open(args.config))
+    gen_cfg = {**GEN_DEFAULTS, **cfg.get("generation", {})}
+    merge_cfg = {"ties_density": 0.5, **cfg.get("merging", {})}
+    control_pairs = [tuple(p) for p in merge_cfg.get("control_pairs", [(42, 43)])]
+    instances = [i for i in build_instances(cfg["training"]["seeds"], control_pairs, args.models_root)
+                 if i["kind"] in ("merge", "control")]
+    instances = select_instances(instances, args.instance)
 
-    if args.generate:
-        from src.eval_prompts import get_all_eval_prompts
-        prompts = get_all_eval_prompts()
+    for inst in instances:
+        missing = [a for a in inst["adapters"] if not Path(a, "adapter_config.json").exists()]
+        if missing:
+            print(f"Skipping {inst['instance']}: adapters not found {missing}")
+            continue
+        model, tokenizer = load_instance_model(inst, density=merge_cfg["ties_density"])
 
-        # Load existing results
-        output_path = Path(args.output)
-        if output_path.exists():
-            existing = json.loads(output_path.read_text())
-            existing_keys = {(r["condition"], r["prompt_id"]) for r in existing}
-            all_results = existing
-        else:
-            existing_keys = set()
-            all_results = []
+        if args.smoke:
+            probe = [{"id": "probe", "prompt": "What role should the government play in healthcare?",
+                      "tier": "probe", "topic": "probe"}]
+            rows = generate_samples(model, tokenizer, probe, inst, samples_per_prompt=1,
+                                    max_new_tokens=120, batch_prompts=1)
+            print(f"\n[{inst['instance']}] {rows[0]['response'][:300]}\n")
 
-        for merge_fn, condition_name in [
-            (merge_linear, "merged_linear"),
-            (merge_ties, "merged_ties"),
-        ]:
-            needed = [p for p in prompts if (condition_name, p["id"]) not in existing_keys]
+        if args.generate:
+            from src.eval_prompts import get_all_eval_prompts
+            prompts = get_all_eval_prompts(n_per_origin=cfg["datasets"]["n_eval_split_per_origin"])
+            rows = load_records(args.output)
+            needed = missing_prompts(rows, inst, prompts, gen_cfg["samples_per_prompt"])
             if not needed:
-                print(f"Skipping {condition_name} — already generated")
-                continue
+                print(f"Skipping {inst['instance']} — complete")
+            else:
+                rows.extend(generate_samples(model, tokenizer, needed, inst, **gen_cfg))
+                save_records(args.output, rows)
+                print(f"Saved {len(rows)} records to {args.output}")
 
-            print(f"\n{'='*60}")
-            print(f"Generating for: {condition_name} ({len(needed)} prompts)")
-            print(f"{'='*60}\n")
-
-            model, tokenizer = load_base_model()
-            model = merge_fn(model, tokenizer)
-            results = generate_responses(model, tokenizer, needed, condition_name)
-            all_results.extend(results)
-
-            # Save incrementally
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(json.dumps(all_results, indent=2))
-            print(f"Saved {len(all_results)} total results to {args.output}")
-
-            # Free memory before next merge
-            del model
+        del model
+        import torch
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-    else:
-        # Just test merging works
-        print("Testing adapter merging (no generation)...\n")
-
-        model, tokenizer = load_base_model()
-        model = merge_linear(model, tokenizer)
-        print("Linear merge: OK")
-
-        # Quick generation test
-        messages = [{"role": "user", "content": "What role should the government play in healthcare?"}]
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(text, return_tensors="pt").to(model.device)
-        with torch.no_grad():
-            outputs = model.generate(**inputs, max_new_tokens=200, temperature=0.7,
-                                     do_sample=True, pad_token_id=tokenizer.pad_token_id)
-        response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        print(f"\nMerged-Linear response: {response[:300]}...")
 
 
 if __name__ == "__main__":
