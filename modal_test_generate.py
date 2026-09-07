@@ -4,6 +4,8 @@ Usage:
     modal run modal_test_generate.py --instance baseline
     modal run modal_test_generate.py --instance sft_right_s42
     modal run modal_test_generate.py --instance merged_ties_s42
+    modal run modal_test_generate.py --base-model gemma4 --instance baseline
+    modal run modal_test_generate.py --base-model gemma4 --instance sft_left_s42 --adapter-suffix _dryrun
 """
 
 import modal
@@ -12,7 +14,7 @@ app = modal.App("preference-collapse-test")
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch", "transformers", "peft", "bitsandbytes", "accelerate")
+    .pip_install("torch", "transformers>=5.15", "peft>=0.19", "bitsandbytes", "accelerate")
     .env({"HF_HOME": "/hf-cache", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
     .add_local_python_source("src")
 )
@@ -50,14 +52,25 @@ def generate_test(instance: dict, n_samples: int = 2):
     print(f"\n{'='*60}\n{instance['instance']}\n{'='*60}")
     for r in rows:
         print(f"[{r['prompt_id']} s{r['sample_idx']}] {r['prompt']}\n  -> {r['response'][:500]}\n")
+    return rows
 
 
 @app.local_entrypoint()
-def main(instance: str = "baseline", n_samples: int = 2):
+def main(instance: str = "baseline", n_samples: int = 2, base_model: str = "mistral",
+         adapter_suffix: str = ""):
+    import json
     import sys
     sys.path.insert(0, ".")
+    from src.base_models import get_base_model, models_root_for
     from src.generation import build_instances
-    matches = [i for i in build_instances() if i["instance"] == instance]
+    spec = get_base_model(base_model)
+    matches = [i for i in build_instances(spec["seeds"], spec["control_pairs"], models_root_for(spec),
+                                          base_model, adapter_suffix)
+               if i["instance"] == instance]
     if not matches:
         raise SystemExit(f"unknown instance {instance}")
-    generate_test.remote(matches[0], n_samples)
+    rows = generate_test.remote(matches[0], n_samples)
+    out = f"data/test_generate_{base_model}_{instance}{adapter_suffix}.json"
+    with open(out, "w") as f:
+        json.dump(rows, f, indent=1)
+    print(f"saved {len(rows)} rows to {out}")

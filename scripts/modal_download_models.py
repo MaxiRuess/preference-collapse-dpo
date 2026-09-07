@@ -4,6 +4,7 @@
 Usage:
     python scripts/modal_download_models.py                  # every *_adapter dir
     python scripts/modal_download_models.py --run sft_left_s42
+    python scripts/modal_download_models.py --base-model gemma4     # -> models/gemma4/
 """
 
 import argparse
@@ -12,15 +13,17 @@ import sys
 from pathlib import Path
 
 
-def _volume_ls() -> list[str]:
+def _volume_ls(subdir: str = "") -> list[str]:
     import json
-    out = subprocess.run(["modal", "volume", "ls", "--json", "preference-collapse-models"],
-                         capture_output=True, text=True)
+    cmd = ["modal", "volume", "ls", "--json", "preference-collapse-models"]
+    if subdir:
+        cmd.append(subdir)
+    out = subprocess.run(cmd, capture_output=True, text=True)
     if out.returncode != 0:
         print(f"Error: {out.stderr}")
         sys.exit(1)
     entries = json.loads(out.stdout)
-    return sorted(e["Filename"] for e in entries
+    return sorted(Path(e["Filename"]).name for e in entries
                   if e.get("Type") == "dir" and e["Filename"].endswith("_adapter"))
 
 
@@ -28,11 +31,15 @@ def main():
     parser = argparse.ArgumentParser(description="Download adapters from Modal")
     parser.add_argument("--run", default=None,
                         help="Run name, e.g. sft_left_s42 (default: all adapters)")
+    parser.add_argument("--base-model", default="mistral")
     args = parser.parse_args()
 
-    models_dir = Path("models")
-    models_dir.mkdir(exist_ok=True)
-    targets = [f"{args.run}_adapter"] if args.run else _volume_ls()
+    from src.base_models import get_base_model
+    spec = get_base_model(args.base_model)
+    subdir = spec["models_subdir"]
+    models_dir = Path("models") / subdir if subdir else Path("models")
+    models_dir.mkdir(parents=True, exist_ok=True)
+    targets = [f"{args.run}_adapter"] if args.run else _volume_ls(subdir)
     if not targets:
         print("No *_adapter directories found on the volume.")
         sys.exit(1)
@@ -43,8 +50,9 @@ def main():
             print(f"Skipping {name} (already downloaded)")
             continue
         # Destination is the parent dir: modal creates models/<name>/ inside it.
+        remote = f"{subdir}/{name}" if subdir else name
         cmd = ["modal", "volume", "get", "--force", "preference-collapse-models",
-               name, str(models_dir)]
+               remote, str(models_dir)]
         print(f"Running: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:

@@ -5,8 +5,9 @@ so that every condition is generated with identical settings.
 
 Instances
 ---------
-An *instance* is one concrete model to evaluate:
-  baseline               Mistral-7B-Instruct-v0.2 as-is
+An *instance* is one concrete model to evaluate (every instance carries the
+tag of the base model it is built on, see src/base_models.py):
+  baseline               the base model as-is
   sft_{cond}_s{seed}     base + the seed's LoRA adapter (delta added exactly)
   merged_linear_s{k}     base + 0.5*dW_left_k + 0.5*dW_right_k
   merged_ties_s{k}       base + TIES(dW_left_k, dW_right_k), density 0.5
@@ -30,13 +31,16 @@ import hashlib
 import json
 from pathlib import Path
 
-BASE_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
+from src.base_models import DEFAULT_BASE_MODEL, clean_response, get_base_model  # noqa: E402
+
+BASE_MODEL = get_base_model(DEFAULT_BASE_MODEL)["hf_id"]
 SFT_CONDITIONS = ("sft_left", "sft_right", "sft_merged")
 MERGE_METHODS = ("linear", "ties")
 
 GEN_DEFAULTS = {
     "temperature": 0.7,
     "top_p": 0.9,
+    "top_k": 50,          # transformers' implicit default; made explicit so every base model matches
     "max_new_tokens": 512,
     "samples_per_prompt": 5,
     "batch_prompts": 8,
@@ -52,10 +56,17 @@ def build_instances(
     seeds=(42, 43, 44),
     control_pairs=((42, 43),),
     models_root: str = "/models",
+    base_model: str = DEFAULT_BASE_MODEL,
+    adapter_suffix: str = "",
 ) -> list[dict]:
-    """Enumerate every model instance of the v2 experiment."""
+    """Enumerate every model instance of the experiment for one base model.
+
+    ``models_root`` is the directory holding ``{cond}_s{seed}_adapter`` dirs
+    (use ``models_root_for(spec, volume_root)`` on Modal). ``adapter_suffix``
+    selects e.g. ``_dryrun`` adapters written by a short training run.
+    """
     seeds = list(seeds)
-    adapter = lambda cond, s: f"{models_root}/{cond}_s{s}_adapter"  # noqa: E731
+    adapter = lambda cond, s: f"{models_root}/{cond}_s{s}_adapter{adapter_suffix}"  # noqa: E731
     inst: list[dict] = []
     inst.append({"instance": "baseline", "condition": "baseline", "kind": "baseline",
                  "seed": None, "adapters": [], "merge_method": None})
@@ -77,6 +88,9 @@ def build_instances(
                              "seed": None,
                              "adapters": [adapter(f"sft_{side}", a), adapter(f"sft_{side}", b)],
                              "merge_method": method})
+    for i in inst:
+        i["base_model"] = base_model
+        i["adapter_suffix"] = adapter_suffix
     return inst
 
 
@@ -166,23 +180,49 @@ def apply_deltas(model, deltas: dict) -> None:
             w.add_(delta.to(device=w.device, dtype=w.dtype))
 
 
+def load_causal_lm(hf_id: str, **kwargs):
+    """Load a checkpoint as a causal LM, falling back to the multimodal class.
+
+    Gemma 4 checkpoints are multimodal; recent transformers releases expose
+    them through AutoModelForCausalLM (text decoder under ``language_model``),
+    older ones only through AutoModelForMultimodalLM. Training and generation
+    both go through this function so module paths agree.
+    """
+    import transformers
+    from transformers import AutoModelForCausalLM
+    try:
+        return AutoModelForCausalLM.from_pretrained(hf_id, **kwargs)
+    except (ValueError, KeyError) as e:
+        cls = getattr(transformers, "AutoModelForMultimodalLM", None)
+        if cls is None:
+            raise
+        print(f"AutoModelForCausalLM failed for {hf_id} ({e}); using AutoModelForMultimodalLM")
+        return cls.from_pretrained(hf_id, **kwargs)
+
+
 def load_base(base_model: str = BASE_MODEL, dtype=None):
-    """Load the bf16 base model and tokenizer (no quantization)."""
+    """Load the bf16 base model and tokenizer (no quantization).
+
+    ``base_model`` may be a registry tag (see src/base_models.py) or an HF id.
+    """
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model, dtype=dtype or torch.bfloat16, device_map="auto",
-    )
+    from transformers import AutoTokenizer
+    from src.base_models import BASE_MODELS
+    hf_id = BASE_MODELS[base_model]["hf_id"] if base_model in BASE_MODELS else base_model
+    model = load_causal_lm(hf_id, dtype=dtype or torch.bfloat16, device_map="auto")
     model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    tokenizer = AutoTokenizer.from_pretrained(hf_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return model, tokenizer
 
 
-def load_instance_model(inst: dict, base_model: str = BASE_MODEL, density: float = 0.5):
-    """Build the model behind an instance dict. Returns (model, tokenizer)."""
-    model, tokenizer = load_base(base_model)
+def load_instance_model(inst: dict, base_model: str | None = None, density: float = 0.5):
+    """Build the model behind an instance dict. Returns (model, tokenizer).
+
+    The base model defaults to the instance's ``base_model`` tag.
+    """
+    model, tokenizer = load_base(base_model or inst.get("base_model", DEFAULT_BASE_MODEL))
     if inst["kind"] == "baseline":
         return model, tokenizer
     device = next(model.parameters()).device
@@ -210,6 +250,7 @@ def generate_samples(
     instance: dict,
     temperature: float = GEN_DEFAULTS["temperature"],
     top_p: float = GEN_DEFAULTS["top_p"],
+    top_k: int = GEN_DEFAULTS["top_k"],
     max_new_tokens: int = GEN_DEFAULTS["max_new_tokens"],
     samples_per_prompt: int = GEN_DEFAULTS["samples_per_prompt"],
     batch_prompts: int = GEN_DEFAULTS["batch_prompts"],
@@ -222,8 +263,9 @@ def generate_samples(
     """
     import torch
 
+    family = get_base_model(instance.get("base_model"))["family"]
     tokenizer.padding_side = "left"
-    gen_params = {"temperature": temperature, "top_p": top_p,
+    gen_params = {"temperature": temperature, "top_p": top_p, "top_k": top_k,
                   "max_new_tokens": max_new_tokens, "samples_per_prompt": samples_per_prompt}
     records: list[dict] = []
 
@@ -249,18 +291,25 @@ def generate_samples(
                 do_sample=True,
                 temperature=temperature,
                 top_p=top_p,
+                top_k=top_k,
                 max_new_tokens=max_new_tokens,
                 num_return_sequences=samples_per_prompt,
                 pad_token_id=tokenizer.pad_token_id,
             )
         prompt_len = inputs["input_ids"].shape[1]
-        decoded = tokenizer.batch_decode(outputs[:, prompt_len:], skip_special_tokens=True)
+        if family == "gemma4":
+            # keep channel markers so clean_response can strip the thought block
+            raw = tokenizer.batch_decode(outputs[:, prompt_len:], skip_special_tokens=False)
+            decoded = [clean_response(x, tokenizer, family) for x in raw]
+        else:
+            decoded = tokenizer.batch_decode(outputs[:, prompt_len:], skip_special_tokens=True)
 
         for p_i, p in enumerate(batch):
             for s_i in range(samples_per_prompt):
                 text = decoded[p_i * samples_per_prompt + s_i]
                 records.append({
                     "prompt_id": p["id"],
+                    "base_model": instance.get("base_model", DEFAULT_BASE_MODEL),
                     "condition": instance["condition"],
                     "instance": instance["instance"],
                     "seed": instance["seed"],
@@ -302,12 +351,25 @@ def save_records(path: str | Path, rows: list[dict]) -> None:
     tmp.replace(p)
 
 
-VOLUME_GEN_DIR = "/models/generations_v2"
+VOLUME_ROOT = "/models"
+
+
+def volume_gen_dir(instance: dict, volume_root: str = VOLUME_ROOT) -> str:
+    """Per-base-model directory for persisted generations on the models volume."""
+    spec = get_base_model(instance.get("base_model"))
+    return f"{volume_root}/{spec['volume_generations_dir']}"
 
 
 def persist_rows_on_volume(rows: list[dict], instance: dict, volume=None) -> None:
-    """Write an instance's rows to the models volume (safety net if the client drops)."""
-    out = Path(VOLUME_GEN_DIR)
+    """Write an instance's rows to the models volume (safety net if the client drops).
+
+    Skipped for dry-run adapters (``adapter_suffix`` set) so the per-instance
+    files on the volume only ever hold rows from the real adapters.
+    """
+    if instance.get("adapter_suffix") and instance["kind"] != "baseline":
+        print(f"  not persisting {instance['instance']} (adapter suffix {instance['adapter_suffix']!r})")
+        return
+    out = Path(volume_gen_dir(instance))
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{instance['instance']}.json"
     existing = json.loads(path.read_text()) if path.exists() else []

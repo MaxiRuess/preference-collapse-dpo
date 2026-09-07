@@ -23,6 +23,15 @@ datasets:
   flip_seeds: [42, 43, 44]   # label-flip draws for sft_merged (one per training seed)
   n_eval_split_per_origin: 75  # Tier 5 prompts sampled per origin
 
+# --- Base models ---
+# The registry of base models (HF id, adapter directory on the volume, seeds,
+# Tier 5 prompt count, output paths) lives in src/base_models.py so the Modal
+# images can import it. Every entry point takes --base-model TAG:
+#   mistral  Mistral-7B-Instruct-v0.2, 3 seeds, 75 Tier 5 prompts/origin (main experiment)
+#   gemma4   google/gemma-4-12B-it,   2 seeds, 30 Tier 5 prompts/origin (replication)
+# The keys below apply to the mistral (default) model; sft_base_model is used by
+# the local src/sft_training.py path only.
+
 # --- Training ---
 training:
   sft_base_model: "mistralai/Mistral-7B-Instruct-v0.2"

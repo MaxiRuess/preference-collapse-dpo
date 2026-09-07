@@ -34,12 +34,22 @@ python scripts/08_analysis_tables.py                    # LaTeX tables -> paper/
 
 # Tests
 python -m pytest tests -q
+
+# Second base model (Gemma-4-12B-it, 2 seeds, 30 Tier 5 prompts/origin; registry in src/base_models.py)
+modal run modal_train.py --base-model gemma4 --condition sft_left --seeds 42 --max-steps 20   # $1 dry run -> *_dryrun dirs
+modal run modal_evaluate.py --base-model gemma4 --instance sft_left_s42 --adapter-suffix _dryrun --limit-prompts 10
+modal run modal_train.py --base-model gemma4 --condition all
+modal run modal_evaluate.py --base-model gemma4 --instance all
+modal run modal_merge_adapters.py --base-model gemma4
+python scripts/06_evaluate.py --base-model gemma4 --score --limit 20 && python scripts/06_evaluate.py --base-model gemma4 --all
+python scripts/08_analysis_tables.py --base-model gemma4        # -> paper/tables/gemma4/
 ```
 
 ## Architecture
 
 - `src/politune_data.py` — loads PoliTune, makes the **global prompt-level split** (`global_split.json`), builds `sft_right`, `sft_left`, `sft_merged_s{seed}` (label flips re-drawn per seed).
 - `src/eval_prompts.py` — 193 prompts: Tiers 1–4 are 43 curated neutral questions (`prompt_kind="question"`); Tier 5 is 150 PoliTune stance instructions held out of every train split, 75 per origin (`prompt_kind="instruction"`).
+- `src/base_models.py` — registry of base models (`mistral`, `gemma4`): HF id, family, adapter dir on the volume, seeds, Tier 5 count, output paths; `resolve_target_modules` (text-decoder q/v only), `clean_response` (strips Gemma 4 thought blocks).
 - `src/generation.py` — instance enumeration, dense adapter deltas (`alpha/r * B @ A`), linear / TIES merging on the deltas via PEFT's `merge_utils`, seeded batched generation. All instances share one inference path: bf16 base + delta.
 - `src/evaluation.py` — judge registry (openai / gemini / fireworks providers), two protocols (`politune` integer-only, `aware` JSON with unscoreable/hedge/coherence), JSONL judge cache, metrics (bootstrap CIs, variance decomposition, Brown-Forsythe, consistency, Pareto, Tier 5 by origin, Krippendorff's alpha).
 - `src/visualization.py` — figures from the results JSON.
@@ -50,7 +60,7 @@ python -m pytest tests -q
 
 | Condition | Instances | How built |
 |---|---|---|
-| `baseline` | 1 | Mistral-7B-Instruct-v0.2 bf16 |
+| `baseline` | 1 | the base model in bf16 (Mistral-7B-Instruct-v0.2; Gemma-4-12B-it for `--base-model gemma4`) |
 | `sft_left`, `sft_right`, `sft_merged` | 3 seeds each | QLoRA adapter (r=16, q/v_proj) applied to the bf16 base |
 | `merged_linear`, `merged_ties` | 3 each | left seed k + right seed k, delta-weight average / TIES (density 0.5) |
 | `ctrl_{linear,ties}_{left,right}` | 1 each | same-ideology merge of seeds 42+43 (control for merge damage) |
@@ -68,7 +78,7 @@ Generation records (`data/eval_generations_v2.json`): `prompt_id, condition, ins
 
 ## Modal
 
-Volumes: `preference-collapse-data` (datasets, `politune_datasets_v2/`), `preference-collapse-models` (`{condition}_s{seed}_adapter/` + trainer checkpoints), `preference-collapse-hf-cache`. Secrets: `wandb-secret`, `huggingface-secret`. GPU: L40S. Compute is meant to fit inside the Starter plan's monthly free credit.
+Volumes: `preference-collapse-data` (datasets, `politune_datasets_v2/`), `preference-collapse-models` (`{condition}_s{seed}_adapter/` + trainer checkpoints; Gemma 4 under `gemma4/`; generations under `generations_v2/` and `generations_v2_gemma4/`), `preference-collapse-hf-cache`. Secrets: `wandb-secret`, `huggingface-secret`. GPU: L40S. Compute is meant to fit inside the Starter plan's monthly free credit.
 
 ## TRL / PEFT notes
 

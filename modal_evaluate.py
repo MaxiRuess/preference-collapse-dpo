@@ -9,6 +9,8 @@ Usage:
     modal run modal_evaluate.py --instance baseline
     modal run modal_evaluate.py --instance sft_left_s42,sft_right_s42
     modal run modal_evaluate.py --instance sft --limit-prompts 10   # dry run
+    modal run modal_evaluate.py --base-model gemma4 --instance all
+    modal run modal_evaluate.py --base-model gemma4 --instance sft_left_s42 --adapter-suffix _dryrun --limit-prompts 10
 """
 
 import modal
@@ -17,7 +19,7 @@ app = modal.App("preference-collapse-eval")
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch", "transformers", "peft", "bitsandbytes", "accelerate")
+    .pip_install("torch", "transformers>=5.15", "peft>=0.19", "bitsandbytes", "accelerate")
     .env({"HF_HOME": "/hf-cache", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
     .add_local_python_source("src")
 )
@@ -50,29 +52,38 @@ def generate_for_instance(instance: dict, prompts: list[dict], gen_cfg: dict) ->
 @app.local_entrypoint()
 def main(
     instance: str = "all",
-    output_file: str = "data/eval_generations_v2.json",
+    output_file: str = "",
     config: str = "configs/config.yaml",
     limit_prompts: int = 0,
+    base_model: str = "mistral",
+    adapter_suffix: str = "",
 ):
     """Generate evaluation responses for baseline and SFT instances."""
     import sys
     sys.path.insert(0, ".")
     import yaml
+    from src.base_models import get_base_model, models_root_for
     from src.eval_prompts import get_all_eval_prompts
     from src.generation import (
         GEN_DEFAULTS, build_instances, load_records, missing_prompts,
         save_records, select_instances,
     )
 
+    spec = get_base_model(base_model)
+    output_file = output_file or spec["generations_file"]
+
     cfg = yaml.safe_load(open(config))
     gen_cfg = {**GEN_DEFAULTS, **cfg.get("generation", {})}
-    seeds = cfg["training"]["seeds"]
-    control_pairs = [tuple(p) for p in cfg.get("merging", {}).get("control_pairs", [])]
+    seeds = spec["seeds"]
+    control_pairs = [tuple(p) for p in spec["control_pairs"]]
 
-    prompts = get_all_eval_prompts(n_per_origin=cfg["datasets"]["n_eval_split_per_origin"])
+    prompts = get_all_eval_prompts(n_per_origin=spec["n_eval_split_per_origin"])
     if limit_prompts:
         prompts = prompts[:limit_prompts]
-    instances = [i for i in build_instances(seeds, control_pairs) if i["kind"] in ("baseline", "sft")]
+    instances = [i for i in build_instances(seeds, control_pairs, models_root_for(spec), base_model,
+                                            adapter_suffix)
+                 if i["kind"] in ("baseline", "sft")]
+    print(f"Base model {spec['hf_id']}: {len(prompts)} prompts, seeds {seeds}")
     instances = select_instances(instances, instance)
 
     rows = load_records(output_file)

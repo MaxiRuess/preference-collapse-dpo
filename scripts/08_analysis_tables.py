@@ -109,13 +109,16 @@ def table_agreement(agr, caption, label):
 def main():
     parser = argparse.ArgumentParser(description="Emit LaTeX tables")
     parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--base-model", default="mistral")
     parser.add_argument("--results", default=None)
-    parser.add_argument("--out-dir", default="paper/tables")
+    parser.add_argument("--out-dir", default=None)
     args = parser.parse_args()
 
-    cfg = yaml.safe_load(open(args.config))
-    results = load_results(args.results or cfg["paths"]["eval_results_file"])
-    out = Path(args.out_dir)
+    from src.base_models import get_base_model
+    spec = get_base_model(args.base_model)
+    yaml.safe_load(open(args.config))  # validates the config exists
+    results = load_results(args.results or spec["eval_results_file"])
+    out = Path(args.out_dir or spec["tables_dir"])
     out.mkdir(parents=True, exist_ok=True)
     primary = results["primary_judge"]
 

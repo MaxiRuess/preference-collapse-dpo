@@ -133,3 +133,62 @@ def test_peft_linear_has_cross_terms(saved_adapters):
     merged = layer.get_delta_weight("lin")
     expected = 0.5 * ref[name]["a0"] + 0.5 * ref[name]["a1"]
     assert not torch.allclose(merged, expected, atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Base-model registry helpers (src/base_models.py)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_target_modules_tiny_mistral():
+    from src.base_models import resolve_target_modules
+    model = _tiny_model()
+    mods = resolve_target_modules(model, ("q_proj", "v_proj"))
+    assert len(mods) == 4  # 2 layers x (q_proj, v_proj)
+    assert all(m.startswith("model.layers.") for m in mods)
+    # explicit full names must be resolvable back to the same Linear modules
+    for m in mods:
+        assert isinstance(model.get_submodule(m), torch.nn.Linear)
+
+
+def test_resolve_target_modules_prefers_language_model_subtree():
+    import torch.nn as nn
+    from src.base_models import resolve_target_modules
+
+    class Wrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision = nn.ModuleDict({"q_proj": nn.Linear(4, 4), "v_proj": nn.Linear(4, 4)})
+            self.language_model = nn.ModuleDict({"q_proj": nn.Linear(4, 4), "v_proj": nn.Linear(4, 4)})
+
+    mods = resolve_target_modules(Wrapper(), ("q_proj", "v_proj"))
+    assert mods == ["language_model.q_proj", "language_model.v_proj"]
+
+
+def test_clean_response_gemma4_strips_thought_block():
+    from src.base_models import clean_response
+
+    class Tok:
+        all_special_tokens = ["<turn|>", "<eos>", "<pad>", "<|channel>", "<channel|>"]
+
+    raw = "<|channel>thought\n<channel|>Yes, the government should.<turn|><pad><pad>"
+    assert clean_response(raw, Tok(), "gemma4") == "Yes, the government should."
+    raw2 = "<|channel>thought\nsome hidden reasoning<channel|>\nAnswer text.<eos>"
+    assert clean_response(raw2, Tok(), "gemma4") == "Answer text."
+    # truncated block (cut by max_new_tokens): opening marker removed, text kept
+    assert clean_response("<|channel>thought\npartial", Tok(), "gemma4") == "partial"
+    # mistral path is a plain strip
+    assert clean_response("  hello </s>", Tok(), "mistral") == "hello </s>"
+
+
+def test_build_instances_carry_base_model_and_root():
+    from src.base_models import get_base_model, models_root_for
+    from src.generation import build_instances
+    spec = get_base_model("gemma4")
+    inst = build_instances(spec["seeds"], spec["control_pairs"], models_root_for(spec), "gemma4")
+    assert len(inst) == 1 + 3 * 2 + 2 * 2 + 4
+    assert all(i["base_model"] == "gemma4" for i in inst)
+    sft = next(i for i in inst if i["instance"] == "sft_left_s42")
+    assert sft["adapters"] == ["/models/gemma4/sft_left_s42_adapter"]
+    dry = build_instances(spec["seeds"], spec["control_pairs"], models_root_for(spec), "gemma4", "_dryrun")
+    assert next(i for i in dry if i["instance"] == "sft_left_s42")["adapters"][0].endswith("_adapter_dryrun")

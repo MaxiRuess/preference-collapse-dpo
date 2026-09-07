@@ -29,14 +29,20 @@ def main():
                         help="Generate eval responses into the v2 generations file")
     parser.add_argument("--smoke", action="store_true",
                         help="Merge and print one short response per instance")
-    parser.add_argument("--output", default="data/eval_generations_v2.json")
+    parser.add_argument("--output", default=None)
+    parser.add_argument("--base-model", default="mistral")
     args = parser.parse_args()
+
+    from src.base_models import get_base_model
+    spec = get_base_model(args.base_model)
+    args.output = args.output or spec["generations_file"]
+    models_root = f"{args.models_root}/{spec['models_subdir']}" if spec["models_subdir"] else args.models_root
 
     cfg = yaml.safe_load(open(args.config))
     gen_cfg = {**GEN_DEFAULTS, **cfg.get("generation", {})}
     merge_cfg = {"ties_density": 0.5, **cfg.get("merging", {})}
-    control_pairs = [tuple(p) for p in merge_cfg.get("control_pairs", [(42, 43)])]
-    instances = [i for i in build_instances(cfg["training"]["seeds"], control_pairs, args.models_root)
+    control_pairs = [tuple(p) for p in spec["control_pairs"]]
+    instances = [i for i in build_instances(spec["seeds"], control_pairs, models_root, args.base_model)
                  if i["kind"] in ("merge", "control")]
     instances = select_instances(instances, args.instance)
 
@@ -56,7 +62,7 @@ def main():
 
         if args.generate:
             from src.eval_prompts import get_all_eval_prompts
-            prompts = get_all_eval_prompts(n_per_origin=cfg["datasets"]["n_eval_split_per_origin"])
+            prompts = get_all_eval_prompts(n_per_origin=spec["n_eval_split_per_origin"])
             rows = load_records(args.output)
             needed = missing_prompts(rows, inst, prompts, gen_cfg["samples_per_prompt"])
             if not needed:

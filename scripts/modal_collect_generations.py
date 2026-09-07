@@ -6,6 +6,7 @@ Safety net for runs whose local client disconnected before results arrived.
 
 Usage:
     python scripts/modal_collect_generations.py
+    python scripts/modal_collect_generations.py --base-model gemma4
 """
 
 import argparse
@@ -15,17 +16,21 @@ import sys
 import tempfile
 from pathlib import Path
 
+from src.base_models import get_base_model
 from src.generation import load_records, merge_rows, save_records
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output-file", default="data/eval_generations_v2.json")
+    parser.add_argument("--base-model", default="mistral")
+    parser.add_argument("--output-file", default=None)
     args = parser.parse_args()
+    spec = get_base_model(args.base_model)
+    args.output_file = args.output_file or spec["generations_file"]
 
     with tempfile.TemporaryDirectory() as tmp:
         cmd = ["modal", "volume", "get", "--force", "preference-collapse-models",
-               "generations_v2/", tmp]
+               f"{spec['volume_generations_dir']}/", tmp]
         print("Running:", " ".join(cmd))
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:

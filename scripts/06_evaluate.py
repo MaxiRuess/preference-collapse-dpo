@@ -12,6 +12,9 @@ Pipeline:
   4. Figures and LaTeX tables:
        python scripts/06_evaluate.py --plot
        python scripts/08_analysis_tables.py
+
+Second base model: add ``--base-model gemma4`` to every command (paths come
+from src/base_models.py; the judge cache is shared).
 """
 
 import argparse
@@ -67,10 +70,12 @@ def _print_summary(results: dict) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Score and evaluate generations")
     parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--base-model", default="mistral",
+                        help="Registry tag (src/base_models.py); sets default generations/results/figures paths")
     parser.add_argument("--generations", default=None,
-                        help="Generations JSON (default: paths.generations_file)")
+                        help="Generations JSON (default: the base model's generations_file)")
     parser.add_argument("--results", default=None,
-                        help="Results JSON (default: paths.eval_results_file)")
+                        help="Results JSON (default: the base model's eval_results_file)")
     parser.add_argument("--figures-dir", default=None)
     parser.add_argument("--score", action="store_true", help="Run the judges")
     parser.add_argument("--metrics", action="store_true", help="Compute metrics from stored scores")
@@ -87,10 +92,11 @@ def main():
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
-    paths = config.get("paths", {})
-    generations = args.generations or paths.get("generations_file", "data/eval_generations_v2.json")
-    results_path = args.results or paths.get("eval_results_file", "data/eval_results_v2.json")
-    figures_dir = args.figures_dir or paths.get("figures_dir", "data/figures_v2")
+    from src.base_models import get_base_model
+    spec = get_base_model(args.base_model)
+    generations = args.generations or spec["generations_file"]
+    results_path = args.results or spec["eval_results_file"]
+    figures_dir = args.figures_dir or spec["figures_dir"]
     judges = args.judge.split(",") if args.judge else None
     protocols = args.protocol.split(",") if args.protocol else None
 
